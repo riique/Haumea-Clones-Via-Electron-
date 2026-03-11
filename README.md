@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/assets/banner.png" alt="Haumea Clones" width="100%" />
+  <img src=".github/assets/banner_v2.png" alt="Haumea Clones" width="100%" />
 </p>
 
 <h3 align="center">
