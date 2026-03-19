@@ -6,15 +6,15 @@ import ApiConfig from './pages/ApiConfig'
 import ChannelClone from './pages/ChannelClone'
 import MultiGroup from './pages/MultiGroup'
 import ForumClone from './pages/ForumClone'
-import Restricted from './pages/Restricted'
+import OpsCenter from './pages/OpsCenter'
 import { useTelegram } from './hooks/useTelegram'
 
 const TABS = [
-    { id: 'config', label: 'Configuração', short: 'API', description: 'Credenciais e proteção da sessão.' },
-    { id: 'clone', label: 'Clone Direto', short: 'CC', description: 'Fluxo principal de clonagem de canais.' },
-    { id: 'multi', label: 'Multi-Grupo', short: 'MG', description: 'Automação e distribuição em lotes.' },
-    { id: 'forum', label: 'Fórum', short: 'FM', description: 'Replicação estrita de tópicos.' },
-    { id: 'restricted', label: 'Restrito', short: 'RS', description: 'Operações em ambientes controlados.' },
+    { id: 'config', label: 'Configuração', short: 'API', description: 'Credenciais, sessão local e parâmetros globais.' },
+    { id: 'clone', label: 'Clonar Canal', short: 'CC', description: 'Fluxo principal com retomada, análise prévia e bypass automático para conteúdo protegido.' },
+    { id: 'multi', label: 'Clone Tópicos', short: 'CT', description: 'Distribui grupos em tópicos de destino com tratamento automático de mídia protegida.' },
+    { id: 'forum', label: 'Clone Fórum', short: 'CF', description: 'Replica tópicos e mensagens com bypass RAM transparente quando necessário.' },
+    { id: 'ops', label: 'Monitoramento', short: 'MN', description: 'Indicadores de clonagem, mídia, erros, histórico e sync contínua.' },
 ]
 
 export default function App() {
@@ -27,7 +27,7 @@ export default function App() {
             case 'clone': return <ChannelClone telegram={telegram} />
             case 'multi': return <MultiGroup telegram={telegram} />
             case 'forum': return <ForumClone telegram={telegram} />
-            case 'restricted': return <Restricted telegram={telegram} />
+            case 'ops': return <OpsCenter telegram={telegram} />
             default: return null
         }
     }
@@ -37,7 +37,6 @@ export default function App() {
     return (
         <div className="app-layout">
             <aside className="layout-col layout-nav">
-                <WindowDragStrip />
                 <NavigationSidebar
                     activeTab={activeTab}
                     onSelect={setActiveTab}

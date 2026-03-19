@@ -1,239 +1,166 @@
-<p align="center">
-  <img src=".github/assets/banner_v2.png" alt="Haumea Clones" width="100%" />
-</p>
+# Haumea Clones
 
-<h3 align="center">
-  Ferramenta profissional de clonagem de canais do Telegram
-</h3>
+Aplicativo desktop para clonagem e sincronização de canais, grupos e fóruns do Telegram, com interface em Electron/React e backend Python via Telethon.
 
-<p align="center">
-  <code>Electron</code> · <code>React</code> · <code>Python</code> · <code>Telethon</code>
-</p>
+## Visão Geral
 
-<p align="center">
-  <a href="#arquitetura">Arquitetura</a> ·
-  <a href="#módulos">Módulos</a> ·
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#build">Build</a> ·
-  <a href="#contribuindo">Contribuindo</a>
-</p>
+O Haumea Clones foi pensado para operação real, não só para testes. O app reúne:
 
----
+- clonagem de canal para canal ou grupo
+- retomada por checkpoint
+- análise prévia antes de iniciar
+- sync contínua para novas mensagens
+- clone de múltiplos grupos para tópicos
+- clone completo de fóruns
+- bypass automático para conteúdo protegido
+- proteção local com frequência e pausas aleatórias
+- deduplicação persistente entre execuções
+- monitoramento de histórico, erros e throughput
 
-## O que é
+## Stack
 
-**Haumea Clones** é uma aplicação desktop que replica mensagens entre canais, grupos e fóruns do Telegram — incluindo mídia, formatação, stickers, enquetes e mensagens de voz.
-
-Construída sobre uma arquitetura de duas camadas: um **frontend Electron/React** que renderiza a interface e um **backend Python** que opera a API do Telegram via [Telethon](https://github.com/LonamiWebs/Telethon). Comunicação entre as camadas acontece por **JSON-RPC 2.0** sobre stdin/stdout.
-
-### Por que "Haumea"
-
-> Haumea é um planeta-anão no cinturão de Kuiper, notável por sua forma alongada e pela capacidade de gerar fragmentos — seus "clones" orbitais. O nome reflete o propósito da ferramenta: replicar conteúdo com precisão cirúrgica.
-
----
+- Electron 35
+- React 19 + Vite 6
+- Python + Telethon
+- JSON-RPC 2.0 via stdin/stdout
+- electron-store para credenciais locais
+- PyInstaller para empacotar o backend
+- electron-builder para gerar o `.exe`
 
 ## Arquitetura
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    ELECTRON SHELL                       │
-│                                                         │
-│   ┌──────────┐   IPC Bridge    ┌──────────────────┐     │
-│   │  React   │◄──────────────►│  python-bridge   │     │
-│   │  (Vite)  │                │     (.cjs)       │     │
-│   └──────────┘                └────────┬─────────┘     │
-│                                        │ stdin/stdout   │
-│                                        ▼                │
-│                               ┌──────────────────┐     │
-│                               │  Python Server   │     │
-│                               │  (JSON-RPC 2.0)  │     │
-│                               └────────┬─────────┘     │
-│                                        │                │
-│                                        ▼                │
-│                               ┌──────────────────┐     │
-│                               │    Telethon      │     │
-│                               │  (Telegram MTProto)│   │
-│                               └──────────────────┘     │
-└─────────────────────────────────────────────────────────┘
+```text
+Electron (main/preload)
+    -> bridge Node.js
+    -> processo Python
+    -> Telethon / Telegram API
+
+Renderer React
+    -> IPC segura
+    -> JSON-RPC
+    -> logs, progresso, sessão e telemetria
 ```
 
-| Camada | Tecnologia | Função |
-|---|---|---|
-| **Shell** | Electron 35 | Janela nativa, titlebar customizada, IPC |
-| **Renderer** | React 19 + Vite 6 | UI reativa, estado de conexão, telemetria |
-| **Bridge** | Node.js (CommonJS) | Spawn do processo Python, roteamento JSON-RPC |
-| **Backend** | Python 3.9+ | Lógica de clonagem, gerenciamento de sessão, anti-flood |
-| **Network** | Telethon + cryptg | MTProto, seleção automática IPv4/IPv6, aceleração crypto |
+## Módulos do App
 
----
+### Configuração
 
-## Módulos
+- credenciais da API do Telegram
+- sessão local persistida
+- limpeza de sessão
+- proteção local
+- deduplicação
 
-### `CC` — Clone Direto
-Fluxo principal. Replica todas as mensagens de um canal origem para um destino, respeitando ordem cronológica, formatação original e mídia anexada.
+### Clonar Canal
 
-### `MG` — Multi-Grupo
-Distribuição em lotes. Clona o conteúdo de origem para múltiplos destinos simultâneos, criando tópicos de fórum automaticamente quando necessário.
+- clone principal entre origem e destino
+- retomada de progresso salvo
+- análise prévia
+- sync contínua
 
-### `FM` — Fórum
-Replicação estrita de tópicos. Lê a estrutura de fórum do canal origem e recria cada tópico no destino preservando a hierarquia.
+### Clone Tópicos
 
-### `RS` — Restrito
-Bypass de canais com proteção de forwarding. Faz download local da mídia e re-upload para o destino, com barra de progresso granular por arquivo e opção de skip.
+- envia múltiplos grupos para um fórum de destino
+- cria os tópicos automaticamente
 
----
+### Clone Fórum
 
-## Quick Start
+- replica tópicos e mensagens de um fórum para outro
 
-### Pré-requisitos
+### Monitoramento
 
-| Requisito | Versão |
-|---|---|
-| Node.js | 18+ |
-| Python | 3.9+ |
-| pip | latest |
+- execuções recentes
+- job atual
+- erros consolidados
+- métricas operacionais
 
-### 1. Clone o repositório
+## Persistência Local
+
+O app mantém estado local para evitar retrabalho e melhorar estabilidade:
+
+- credenciais e sessão via `electron-store`
+- checkpoints em `progress/`
+- histórico e erros em `history/`
+- deduplicação e config persistente em `state/`
+
+## Estrutura do Projeto
+
+```text
+backend/
+  server.py              Backend JSON-RPC e lógica Telethon
+electron/
+  main.cjs               Processo principal do Electron
+  preload.cjs            Bridge segura para o renderer
+  python-bridge.cjs      Spawn e comunicação com o backend
+src/
+  components/            Componentes visuais
+  hooks/                 useTelegram
+  lib/                   Utilitários do renderer
+  pages/                 Telas principais do app
+dist-python/             Backend compilado
+release/                 Artefatos de build Windows
+```
+
+## Requisitos
+
+- Node.js 18+
+- Python 3.9+
+- Windows para gerar o instalador `.exe`
+
+## Desenvolvimento
+
+Instale as dependências:
 
 ```bash
-git clone https://github.com/riique/Haumea-Clones-Via-Electron-.git
-cd Haumea-Clones-Via-Electron-
-```
-
-### 2. Instale as dependências
-
-```bash
-# Frontend
 npm install
-
-# Backend
 pip install -r requirements.txt
 ```
 
-### 3. Configure suas credenciais
-
-Crie o arquivo `config.json` a partir do exemplo:
-
-```bash
-cp config.example.json config.json
-```
-
-Preencha com suas credenciais da [Telegram API](https://my.telegram.org/apps):
-
-```json
-{
-    "api_id": "SEU_API_ID",
-    "api_hash": "SEU_API_HASH",
-    "phone": "+SEU_NUMERO"
-}
-```
-
-### 4. Execute em modo de desenvolvimento
+Rode em desenvolvimento:
 
 ```bash
 npm run dev
 ```
 
-> A janela Electron abre automaticamente após o Vite compilar o renderer.
-
----
-
 ## Build
 
-### Gerar executável Windows (.exe)
+Para gerar só o renderer:
 
 ```bash
-# Compilar o backend Python em binário standalone
-npm run build:python
+npm run build:renderer
+```
 
-# Build completo (renderer + electron-builder)
+Para gerar o backend compilado:
+
+```bash
+npm run build:python
+```
+
+Para gerar o pacote Windows completo com backend embutido:
+
+```bash
 npm run build
 ```
 
-O instalador será gerado em `release/`.
+Saídas esperadas:
 
----
-
-## Estrutura do Projeto
-
-```
-.
-├── backend/
-│   └── server.py              # JSON-RPC server (Telethon)
-├── electron/
-│   ├── main.cjs               # Electron main process
-│   ├── preload.cjs            # Context bridge
-│   └── python-bridge.cjs      # Spawn + comunicação com Python
-├── src/
-│   ├── components/            # UI components (Card, Modal, Sidebar...)
-│   ├── hooks/                 # useTelegram — estado global
-│   ├── lib/                   # Utilidades (anti-flood config)
-│   ├── pages/                 # Módulos (Clone, Multi, Forum, Restricted)
-│   ├── App.jsx                # Root layout
-│   ├── index.css              # Design system
-│   └── main.jsx               # Entry point
-├── config.example.json        # Template de credenciais
-├── haumea_rpc.py              # Helpers RPC compartilhados
-├── requirements.txt           # Dependências Python
-├── vite.config.js             # Configuração Vite
-└── package.json               # Scripts e dependências Node
-```
-
----
+- `dist-python/haumea-backend.exe`
+- `release/Haumea Clones Setup 2.0.0.exe`
+- `release/win-unpacked/Haumea Clones.exe`
 
 ## Segurança
 
-- **Sessão Telethon** (`.session`) nunca é commitada — está no `.gitignore`
-- **Credenciais** (`config.json`) são excluídas do versionamento
-- **Context Isolation** ativo no Electron — `nodeIntegration: false`
-- **Preload script** expõe apenas os métodos necessários via `contextBridge`
-- Credenciais salvas localmente via `electron-store` com escopo isolado
+- `contextIsolation` ativo
+- `nodeIntegration` desativado
+- comunicação renderer/backend mediada por preload
+- sessão e credenciais mantidas localmente
 
----
+## Observações
 
-## Stack Detalhada
-
-<table>
-  <tr>
-    <td><b>Frontend</b></td>
-    <td>React 19 · Vite 6 · Tailwind CSS 4 · Vanilla CSS</td>
-  </tr>
-  <tr>
-    <td><b>Desktop</b></td>
-    <td>Electron 35 · electron-builder · electron-store</td>
-  </tr>
-  <tr>
-    <td><b>Backend</b></td>
-    <td>Python 3.9+ · Telethon · cryptg · PySocks</td>
-  </tr>
-  <tr>
-    <td><b>Protocolo</b></td>
-    <td>JSON-RPC 2.0 via stdin/stdout</td>
-  </tr>
-  <tr>
-    <td><b>Build</b></td>
-    <td>PyInstaller (backend) · electron-builder (desktop)</td>
-  </tr>
-</table>
-
----
-
-## Contribuindo
-
-1. Fork o repositório
-2. Crie uma branch para sua feature (`git checkout -b feat/nova-feature`)
-3. Commit suas mudanças (`git commit -m 'feat: descrição'`)
-4. Push para a branch (`git push origin feat/nova-feature`)
-5. Abra um Pull Request
-
----
+- o app depende de credenciais válidas da API do Telegram
+- o ritmo de envio deve respeitar limites da conta e do Telegram
+- a proteção local ajuda, mas não elimina FloodWait
 
 ## Licença
 
-Distribuído sob a licença **MIT**. Veja [`LICENSE`](LICENSE) para mais detalhes.
-
----
-
-<p align="center">
-  <sub>Construído com precisão orbital por <a href="https://github.com/riique">@riique</a></sub>
-</p>
+MIT

@@ -77,24 +77,70 @@ class PythonBridge {
         return this.startPromise
     }
 
-    stop() {
-        if (!this.process) return
+    _waitForExit(timeoutMs = 4000) {
+        const activeProcess = this.process
+        if (!activeProcess) return Promise.resolve(true)
+
+        return new Promise((resolve) => {
+            let settled = false
+            const cleanup = () => {
+                clearTimeout(timer)
+                activeProcess.removeListener('close', onClose)
+            }
+            const onClose = () => {
+                if (settled) return
+                settled = true
+                cleanup()
+                resolve(true)
+            }
+            const timer = setTimeout(() => {
+                if (settled) return
+                settled = true
+                cleanup()
+                resolve(false)
+            }, timeoutMs)
+
+            activeProcess.once('close', onClose)
+        })
+    }
+
+    async stop() {
+        if (this.startPromise) {
+            try {
+                await this.startPromise
+            } catch {
+                // no-op
+            }
+        }
+        if (!this.process) return { ok: true }
+
         try {
-            this.send('shutdown', {}).catch(() => { })
-            setTimeout(() => {
-                if (this.process) {
-                    this.process.kill()
-                    this.process = null
-                }
-            }, 2000)
+            await Promise.race([
+                this.send('shutdown', {}).catch(() => null),
+                new Promise((resolve) => setTimeout(resolve, 2500)),
+            ])
+            const exitedGracefully = await this._waitForExit(2500)
+            if (!exitedGracefully && this.process) {
+                this.process.kill()
+                await this._waitForExit(2000)
+            }
+            return { ok: true }
         } catch {
-            this.process?.kill()
-            this.process = null
+            if (this.process) {
+                this.process.kill()
+                await this._waitForExit(2000)
+            }
+            return { ok: false }
         }
     }
 
     async send(method, params = {}) {
-        if (!this.process) {
+        if (this.startPromise) {
+            const started = await this.startPromise
+            if (!started?.ok || !this.process) {
+                throw new Error(started?.error || 'Python process not running')
+            }
+        } else if (!this.process) {
             const started = await this.start()
             if (!started?.ok || !this.process) {
                 throw new Error(started?.error || 'Python process not running')

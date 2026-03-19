@@ -26,6 +26,8 @@ config.json
 
 # Progress state
 progress/
+history/
+state/
 
 # OS junk
 Thumbs.db

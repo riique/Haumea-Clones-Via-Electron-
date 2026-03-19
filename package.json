@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron . --dev\"",
     "build:renderer": "vite build",
-    "build:python": "pyinstaller --onefile --name haumea-backend --distpath ./dist-python backend/server.py",
-    "build": "npm run build:renderer && electron-builder",
+    "build:python": "pyinstaller --onefile --name haumea-backend --paths . --hidden-import haumea_rpc --distpath ./dist-python backend/server.py",
+    "build": "npm run build:python && npm run build:renderer && electron-builder",
     "preview": "vite preview"
   },
   "author": "riiquestudies",

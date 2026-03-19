@@ -6,7 +6,9 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
     return (
         <div className="nav-shell">
             <div className="brand titlebar-nodrag">
-                <h1 className="brand-name">Haumea</h1>
+                <span className="nav-eyebrow">Painel</span>
+                <h1 className="brand-name">Haumea Clones</h1>
+                <p className="brand-desc">Ferramentas de clonagem e gestão em um fluxo mais claro.</p>
             </div>
 
             <div className="nav-scroll titlebar-nodrag">
@@ -21,7 +23,9 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
                                 type="button"
                             >
                                 <span className="nav-icon">{tab.short}</span>
-                                <span>{tab.label}</span>
+                                <span className="nav-copy">
+                                    <span className="nav-label">{tab.label}</span>
+                                </span>
                             </button>
                         )
                     })}
@@ -31,12 +35,19 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
             <footer className="nav-footer titlebar-nodrag">
                 <div className="status-pill">
                     <span className={`indicator ${indClass}`} />
-                    <span>{connected ? 'Sessão Ativa' : pending ? 'Conectando...' : 'Desconectado'}</span>
+                    <span>{connected ? 'Sessão ativa' : pending ? 'Conectando...' : 'Desconectado'}</span>
                 </div>
 
                 <div className="user-meta">
                     <strong>{user?.name ?? 'Sessão ausente'}</strong>
                     <span>{user?.username ? `@${user.username}` : 'Conecte-se à API'}</span>
+                </div>
+
+                <div className="sidebar-credit">
+                    <span>Criado por </span>
+                    <a href="https://x.com/riiquestudies" target="_blank" rel="noreferrer">
+                        @riiquestudies
+                    </a>
                 </div>
             </footer>
         </div>

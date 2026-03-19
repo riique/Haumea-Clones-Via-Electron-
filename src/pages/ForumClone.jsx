@@ -44,13 +44,13 @@ export default function ForumClone({ telegram }) {
 
     return (
         <div className="data-grid">
-            <Card eyebrow="ESTRUTURA" title="Clonar Fórum" description="Replicar tópicos e mensagens integralmente.">
+            <Card eyebrow="ESTRUTURA" title="Clone Fórum" description="Replicar tópicos e mensagens com bypass RAM automático para conteúdo protegido.">
                 <div className="form-grid">
-                    <Field label="Fórum de Origem" hint="ID ou @grupo">
+                    <Field label="Fórum de origem" hint="ID ou @grupo">
                         <input value={source} onChange={(e) => setSource(e.target.value)} placeholder="@origem" className="field-input" disabled={running} />
                     </Field>
 
-                    <Field label="Fórum de Destino" hint="ID ou @grupo">
+                    <Field label="Fórum de destino" hint="ID ou @grupo">
                         <input value={dest} onChange={(e) => setDest(e.target.value)} placeholder="@destino" className="field-input" disabled={running} />
                     </Field>
 
@@ -67,24 +67,32 @@ export default function ForumClone({ telegram }) {
                 </div>
             </Card>
 
-            <Card eyebrow="TELEMETRIA" title="Monitoramento" description="Acompanhamento iterativo de tópicos.">
+            <Card eyebrow="TELEMETRIA" title="Monitoramento" description="Acompanhamento iterativo de tópicos com visibilidade do bypass RAM.">
                 {running || isDone || percent > 0 ? (
                     <>
                         <ProgressBar value={percent} />
                         <div className="kpi-row">
                             <div>
                                 <span className="kpi-val">{forumProgress ? (forumProgress.topic_index || 0) + 1 : '-'}</span>
-                                <span className="kpi-lbl">Tópico Atual</span>
+                                <span className="kpi-lbl">Tópico atual</span>
                             </div>
                             <div>
                                 <span className="kpi-val">{forumProgress?.total_topics ?? '-'}</span>
-                                <span className="kpi-lbl">Total Previsto</span>
+                                <span className="kpi-lbl">Total previsto</span>
+                            </div>
+                            <div>
+                                <span className="kpi-val">{forumProgress?.ram_bypass_used ?? 0}</span>
+                                <span className="kpi-lbl">Bypass RAM</span>
+                            </div>
+                            <div>
+                                <span className="kpi-val">{forumProgress?.errors ?? 0}</span>
+                                <span className="kpi-lbl">Falhas</span>
                             </div>
                         </div>
                     </>
                 ) : (
                     <div className={`status-banner ${connected ? 'ready' : ''}`}>
-                        <strong>{connected ? 'Sistema Preparado' : 'Aguardando Conexão'}</strong>
+                        <strong>{connected ? 'Sistema preparado' : 'Aguardando conexão'}</strong>
                         <p>{connected ? 'Origem e destino devem ter tópicos habilitados na configuração do grupo.' : 'Requer sessão ativa no Telegram.'}</p>
                     </div>
                 )}

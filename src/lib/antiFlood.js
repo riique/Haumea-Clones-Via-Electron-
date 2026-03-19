@@ -8,14 +8,6 @@ function toPositiveFloat(value, fallback) {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
-function randomBetween(min, max) {
-    return Math.floor(Math.random() * (max - min + 1)) + min
-}
-
-function randomFloatBetween(min, max) {
-    return Number((Math.random() * (max - min) + min).toFixed(2))
-}
-
 export function resolveAntiFloodConfig(config = {}) {
     const enabled = config.anti_flood_enabled !== false
     const legacyEvery = toPositiveInt(config.anti_flood_pause_every, 50)
@@ -30,7 +22,11 @@ export function resolveAntiFloodConfig(config = {}) {
     const upperDuration = Math.max(durationMin, durationMax)
 
     return {
-        pause_every: enabled ? randomBetween(lowerEvery, upperEvery) : 0,
-        pause_duration: enabled ? randomFloatBetween(lowerDuration, upperDuration) : 0,
+        pause_every: enabled ? lowerEvery : 0,
+        pause_every_min: enabled ? lowerEvery : 0,
+        pause_every_max: enabled ? upperEvery : 0,
+        pause_duration: enabled ? lowerDuration : 0,
+        pause_duration_min: enabled ? lowerDuration : 0,
+        pause_duration_max: enabled ? upperDuration : 0,
     }
 }

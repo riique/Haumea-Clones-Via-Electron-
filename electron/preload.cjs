@@ -28,5 +28,7 @@ contextBridge.exposeInMainWorld('electron', {
         set: (key, value) => ipcRenderer.invoke('store:set', key, value),
         delete: (key) => ipcRenderer.invoke('store:delete', key),
         getAll: () => ipcRenderer.invoke('store:getAll'),
+        patchCredentials: (patch) => ipcRenderer.invoke('store:patchCredentials', patch),
+        clearSession: () => ipcRenderer.invoke('store:clearSession'),
     },
 })

@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import sys
 import json
+import io
 import asyncio
 import threading
 import hashlib
+import mimetypes
 import random
-import tempfile
 import os
-import socket
 import time
 from pathlib import Path
 from datetime import datetime
@@ -23,6 +23,8 @@ if str(ROOT_DIR) not in sys.path:
 
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, RPCError
+from telethon.sessions import StringSession
+from telethon.utils import get_input_channel
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage,
     MessageMediaContact, MessageMediaGeo, MessageMediaPoll,
@@ -30,7 +32,8 @@ from telethon.tl.types import (
     MessageMediaVenue, MessageMediaDice, MessageMediaStory,
     DocumentAttributeSticker, DocumentAttributeVideo,
     DocumentAttributeAudio, DocumentAttributeAnimated,
-    PeerChannel, InputPeerChannel,
+    PeerChannel, InputPeerChannel, InputChannel,
+    Channel, ChannelForbidden,
     MessageMediaUnsupported, DocumentAttributeFilename
 )
 from telethon.tl.tlobject import TLRequest
@@ -157,12 +160,42 @@ class HaumeaServer:
         self.loop = None
         self._dialogs_cached = False
         self.stop_flag = False
-        self.skip_current_file = False
         self.progress_dir = Path("progress")
         self.progress_dir.mkdir(exist_ok=True)
-        self._download_start_time = 0
-        self._download_last_bytes = 0
+        self.history_dir = Path("history")
+        self.history_dir.mkdir(exist_ok=True)
+        self.state_dir = Path("state")
+        self.state_dir.mkdir(exist_ok=True)
+        self.config_file = self.state_dir / "config.json"
+        self.session_name = "haumea_session"
+        self.session_base_path = self.state_dir.resolve() / self.session_name
+        self.history_file = self.history_dir / "jobs.jsonl"
+        self.error_file = self.history_dir / "errors.json"
+        self.error_index = self._load_json_file(self.error_file, {})
+        self.runtime_state = {
+            "active_job": None,
+            "last_job": None,
+        }
+        self.sync_task = None
+        self.sync_state = {
+            "active": False,
+            "source": "",
+            "dest": "",
+            "source_title": "",
+            "dest_title": "",
+            "processed": 0,
+            "media_files": 0,
+            "ram_bypass_used": 0,
+            "skipped_duplicates": 0,
+            "errors": 0,
+            "poll_interval": 15,
+            "delay": 0.2,
+            "last_seen_id": 0,
+            "started_at": None,
+            "last_poll_at": None,
+        }
         self.connect_timeout = 25
+        self._last_send_used_ram_bypass = False
 
     # ── Notifications (push to Electron) ──
 
@@ -212,13 +245,12 @@ class HaumeaServer:
     def rpc_ping(self):
         return {"pong": True}
 
-    def rpc_shutdown(self):
-        if self.client and self.loop:
-            try:
-                asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
-            except Exception:
-                pass
-        sys.exit(0)
+    async def rpc_shutdown(self):
+        if self.sync_task:
+            self.sync_task.cancel()
+            self.sync_task = None
+        await self._dispose_client()
+        return {"ok": True}
 
     def rpc_get_saved_progress(self):
         files = list(self.progress_dir.glob("clone_*.json"))
@@ -230,6 +262,7 @@ class HaumeaServer:
                 results.append(data)
             except Exception:
                 pass
+        results.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
         return {"progress_files": results}
 
     def rpc_delete_progress(self, file_path=""):
@@ -238,109 +271,652 @@ class HaumeaServer:
             p.unlink()
         return {"ok": True}
 
+    def _get_config_paths(self, path="config.json"):
+        if path and path != "config.json":
+            return [Path(path)]
+
+        paths = [self.config_file]
+        legacy_path = Path("config.json")
+        if legacy_path != self.config_file:
+            paths.append(legacy_path)
+        return paths
+
     def rpc_load_config(self, path="config.json"):
-        p = Path(path)
-        if p.exists():
-            return json.loads(p.read_text(encoding="utf-8"))
+        for candidate in self._get_config_paths(path):
+            if candidate.exists():
+                return json.loads(candidate.read_text(encoding="utf-8"))
         return {}
 
     def rpc_save_config(self, config=None, path="config.json"):
-        if config:
-            Path(path).write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+        if config is not None:
+            target = self._get_config_paths(path)[0]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
         return {"ok": True}
+
+    def _load_json_file(self, path, fallback):
+        try:
+            p = Path(path)
+            if p.exists():
+                return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return fallback
+
+    def _save_json_file(self, path, data):
+        Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _to_positive_int(self, value, fallback):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return parsed if parsed > 0 else fallback
+
+    def _to_positive_float(self, value, fallback):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return parsed if parsed > 0 else fallback
+
+    def _resolve_anti_flood_config(
+        self,
+        pause_every=50,
+        pause_duration=2,
+        pause_every_min=None,
+        pause_every_max=None,
+        pause_duration_min=None,
+        pause_duration_max=None,
+    ):
+        max_every_seed = pause_every_max if pause_every_max is not None else pause_every
+        max_duration_seed = pause_duration_max if pause_duration_max is not None else pause_duration
+        enabled = self._to_positive_int(max_every_seed, 0) > 0 and self._to_positive_float(max_duration_seed, 0) > 0
+
+        if not enabled:
+            return {
+                "enabled": False,
+                "every_min": 0,
+                "every_max": 0,
+                "duration_min": 0,
+                "duration_max": 0,
+            }
+
+        legacy_every = self._to_positive_int(pause_every, 50)
+        every_min = self._to_positive_int(pause_every_min, legacy_every)
+        every_max = self._to_positive_int(pause_every_max, legacy_every)
+        legacy_duration = self._to_positive_float(pause_duration, 2)
+        duration_min = self._to_positive_float(pause_duration_min, legacy_duration)
+        duration_max = self._to_positive_float(pause_duration_max, legacy_duration)
+
+        return {
+            "enabled": True,
+            "every_min": min(every_min, every_max),
+            "every_max": max(every_min, every_max),
+            "duration_min": min(duration_min, duration_max),
+            "duration_max": max(duration_min, duration_max),
+        }
+
+    def _next_anti_flood_cycle(self, anti_flood, processed_so_far=0):
+        if not anti_flood.get("enabled"):
+            return None
+
+        frequency = random.randint(anti_flood["every_min"], anti_flood["every_max"])
+        duration = round(random.uniform(anti_flood["duration_min"], anti_flood["duration_max"]), 2)
+        return {
+            "after_messages": processed_so_far + frequency,
+            "frequency": frequency,
+            "duration": duration,
+        }
+
+    def _format_seconds(self, value):
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+    def _pair_hash(self, source, dest, prefix="pair"):
+        raw = f"{prefix}:{source}:{dest}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _build_runtime_metrics(self, started_at, processed, total):
+        elapsed_seconds = max(1, int(time.time() - started_at))
+        rate_per_minute = round((processed / elapsed_seconds) * 60, 2) if processed else 0
+        remaining = max(total - processed, 0)
+        eta_seconds = int((remaining / (rate_per_minute / 60))) if rate_per_minute > 0 else None
+        return {
+            "elapsed_seconds": elapsed_seconds,
+            "messages_per_minute": rate_per_minute,
+            "eta_seconds": eta_seconds,
+            "eta_label": self._format_eta(eta_seconds) if eta_seconds is not None else "calculando...",
+        }
+
+    def _set_active_job(self, operation, payload):
+        self.runtime_state["active_job"] = {
+            "operation": operation,
+            **payload,
+            "updated_at": datetime.now().isoformat(),
+        }
+
+    def _finish_active_job(self, payload):
+        finished = {
+            **(self.runtime_state.get("active_job") or {}),
+            **payload,
+            "updated_at": datetime.now().isoformat(),
+        }
+        self.runtime_state["last_job"] = finished
+        self.runtime_state["active_job"] = None
+
+    def _append_history_entry(self, entry):
+        line = json.dumps(entry, ensure_ascii=False)
+        with self.history_file.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+    def _read_history_entries(self, limit=50):
+        if not self.history_file.exists():
+            return []
+        try:
+            lines = self.history_file.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+
+        items = []
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                items.append(json.loads(line))
+            except Exception:
+                continue
+            if len(items) >= limit:
+                break
+        return items
+
+    def _create_history_entry(self, operation, status, source, dest, source_title, dest_title, started_at, **metrics):
+        finished_at = datetime.now().isoformat()
+        duration_seconds = 0
+        if started_at:
+            try:
+                started_ts = datetime.fromisoformat(started_at).timestamp()
+                duration_seconds = max(0, int(time.time() - started_ts))
+            except Exception:
+                duration_seconds = 0
+        return {
+            "operation": operation,
+            "status": status,
+            "source": source,
+            "dest": dest,
+            "source_title": source_title,
+            "dest_title": dest_title,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_seconds": duration_seconds,
+            **metrics,
+        }
+
+    def rpc_get_history(self, limit=40):
+        entries = self._read_history_entries(limit=int(limit or 40))
+        return {"entries": entries}
+
+    def rpc_clear_history(self):
+        if self.history_file.exists():
+            self.history_file.unlink()
+        return {"ok": True}
+
+    def _classify_error(self, exc):
+        message = str(exc)
+        lowered = message.lower()
+
+        if isinstance(exc, FloodWaitError) or "floodwait" in lowered:
+            return {
+                "category": "flood_wait",
+                "title": "Flood wait detectado",
+                "action": "Aumente a pausa, reduza a taxa de envio ou retome mais tarde.",
+            }
+        if "não foi possível encontrar" in lowered or "username" in lowered or "cannot find" in lowered:
+            return {
+                "category": "entity_resolution",
+                "title": "Origem ou destino não resolvido",
+                "action": "Confira @username, link t.me ou ID numérico antes de reenviar.",
+            }
+        if "forbidden" in lowered or "permission" in lowered or "admin" in lowered:
+            return {
+                "category": "permissions",
+                "title": "Permissão insuficiente",
+                "action": "Verifique se a conta pode postar, criar tópicos ou acessar o chat.",
+            }
+        if "reply_to" in lowered or "topic" in lowered:
+            return {
+                "category": "topics",
+                "title": "Falha de tópico ou roteamento",
+                "action": "Revise o ID do tópico e se o destino realmente é fórum.",
+            }
+        if is_file_reference_error(exc) or "file reference" in lowered:
+            return {
+                "category": "media_reference",
+                "title": "Referência de mídia expirada",
+                "action": "Recarregue a mensagem; o reenvio tenta renovar a referência e aplicar o bypass em RAM automaticamente.",
+            }
+        if "timeout" in lowered or "timed out" in lowered or "network" in lowered:
+            return {
+                "category": "network",
+                "title": "Instabilidade de rede",
+                "action": "Valide a conexão e tente novamente com delays maiores.",
+            }
+        if "password" in lowered or "authorized" in lowered or "session" in lowered:
+            return {
+                "category": "session",
+                "title": "Problema de sessão",
+                "action": "Reconecte a conta e confira a autenticação em duas etapas.",
+            }
+        return {
+            "category": "unknown",
+            "title": "Erro não classificado",
+            "action": "Revise o log detalhado e repita o job com lote menor para isolar a falha.",
+        }
+
+    def _record_error(self, exc, operation, context=None):
+        classification = self._classify_error(exc)
+        key = f"{operation}:{classification['category']}:{classification['title']}"
+        existing = self.error_index.get(key, {
+            "key": key,
+            "operation": operation,
+            "category": classification["category"],
+            "title": classification["title"],
+            "action": classification["action"],
+            "count": 0,
+            "last_message": "",
+            "last_context": {},
+            "last_seen": None,
+        })
+        existing["count"] += 1
+        existing["last_message"] = str(exc)
+        existing["last_context"] = context or {}
+        existing["last_seen"] = datetime.now().isoformat()
+        self.error_index[key] = existing
+        self._save_json_file(self.error_file, self.error_index)
+
+    def rpc_get_error_summary(self):
+        items = sorted(
+            self.error_index.values(),
+            key=lambda item: (item.get("count", 0), item.get("last_seen") or ""),
+            reverse=True,
+        )
+        return {"items": items[:20]}
+
+    def rpc_clear_error_summary(self):
+        self.error_index = {}
+        self._save_json_file(self.error_file, self.error_index)
+        return {"ok": True}
+
+    def get_dedupe_filename(self, source, dest):
+        hash_key = self._pair_hash(source, dest, prefix="dedupe")
+        return self.state_dir / f"dedupe_{hash_key}.json"
+
+    def load_dedupe_state(self, source, dest):
+        return self._load_json_file(
+            self.get_dedupe_filename(source, dest),
+            {"message_ids": [], "fingerprints": [], "updated_at": None},
+        )
+
+    def save_dedupe_state(self, source, dest, state):
+        normalized = {
+            "message_ids": list(state.get("message_ids", []))[-20000:],
+            "fingerprints": list(state.get("fingerprints", []))[-20000:],
+            "updated_at": datetime.now().isoformat(),
+        }
+        self._save_json_file(self.get_dedupe_filename(source, dest), normalized)
+        return normalized
+
+    def get_message_fingerprint(self, msg):
+        payload = {
+            "text": msg.message or "",
+            "media_type": self.get_media_type(msg),
+            "reply_to": getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None),
+            "date": msg.date.isoformat() if getattr(msg, "date", None) else None,
+        }
+        if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
+            payload["doc_size"] = msg.media.document.size
+            payload["doc_id"] = msg.media.document.id
+        elif isinstance(msg.media, MessageMediaPhoto) and msg.media.photo:
+            payload["photo_id"] = msg.media.photo.id
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def is_duplicate_message(self, dedupe_state, msg):
+        if not dedupe_state:
+            return False
+        message_ids = set(dedupe_state.get("message_ids", []))
+        fingerprints = set(dedupe_state.get("fingerprints", []))
+        return msg.id in message_ids or self.get_message_fingerprint(msg) in fingerprints
+
+    def mark_message_deduped(self, dedupe_state, msg):
+        if dedupe_state is None:
+            return
+        message_ids = dedupe_state.setdefault("message_ids", [])
+        fingerprints = dedupe_state.setdefault("fingerprints", [])
+        message_ids.append(msg.id)
+        fingerprints.append(self.get_message_fingerprint(msg))
+
+    def rpc_get_dashboard(self):
+        history_items = self._read_history_entries(limit=25)
+        successful_runs = [item for item in history_items if item.get("status") == "success"]
+        total_processed = sum(int(item.get("cloned", 0) or 0) for item in history_items)
+        total_media = sum(int(item.get("media_files", 0) or 0) for item in history_items)
+        total_ram_bypass = sum(int(item.get("ram_bypass_used", item.get("downloaded", 0)) or 0) for item in history_items)
+        total_errors = sum(int(item.get("errors", 0) or 0) for item in history_items)
+        total_duplicates = sum(int(item.get("skipped_duplicates", 0) or 0) for item in history_items)
+        avg_rate = 0
+        if successful_runs:
+            rates = [float(item.get("messages_per_minute", 0) or 0) for item in successful_runs if item.get("messages_per_minute")]
+            avg_rate = round(sum(rates) / len(rates), 2) if rates else 0
+
+        return {
+            "active_job": self.runtime_state.get("active_job"),
+            "last_job": self.runtime_state.get("last_job"),
+            "sync_state": self.sync_state,
+            "recent_history": history_items[:10],
+            "error_summary": self.rpc_get_error_summary().get("items", [])[:8],
+            "summary": {
+                "runs": len(history_items),
+                "success_rate": round((len(successful_runs) / len(history_items)) * 100, 2) if history_items else 0,
+                "total_processed": total_processed,
+                "total_media": total_media,
+                "total_ram_bypass": total_ram_bypass,
+                "total_errors": total_errors,
+                "total_duplicates": total_duplicates,
+                "avg_rate": avg_rate,
+            },
+        }
+
+    async def rpc_dry_run(self, source="", dest="", limit=0, mode="clone"):
+        if not self.logged_in:
+            raise Exception("Não conectado")
+
+        self._dialogs_cached = False
+        source_entity, source_topic_id = await self.resolve_target(source)
+        dest_entity, dest_topic_id = await self.resolve_target(dest)
+
+        source_title = getattr(source_entity, "title", str(source))
+        dest_title = getattr(dest_entity, "title", str(dest))
+        total_messages = 0
+        media_messages = 0
+        estimated_bytes = 0
+
+        async for msg in self.client.iter_messages(
+            source_entity,
+            **self.get_iter_messages_kwargs(limit=limit, reply_to=source_topic_id)
+        ):
+            total_messages += 1
+            if msg.media:
+                media_messages += 1
+            if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
+                estimated_bytes += msg.media.document.size or 0
+
+        saved_progress = None
+        progress_file = self.get_progress_filename(source, dest)
+        if progress_file.exists():
+            saved_progress = self._load_json_file(progress_file, None)
+
+        dedupe_state = self.load_dedupe_state(source, dest)
+        warnings = []
+        if total_messages == 0:
+            warnings.append("Nenhuma mensagem encontrada para o escopo informado.")
+        if source_topic_id and not dest_topic_id and mode == "clone":
+            warnings.append("A origem aponta para um tópico específico; confirme se o destino é o tópico esperado.")
+        if saved_progress:
+            warnings.append("Existe um progresso salvo para este par de chats.")
+
+        return {
+            "ok": True,
+            "mode": mode,
+            "source_title": source_title,
+            "dest_title": dest_title,
+            "total_messages": total_messages,
+            "media_messages": media_messages,
+            "estimated_bytes": estimated_bytes,
+            "estimated_size": self._format_bytes(estimated_bytes),
+            "resumable": bool(saved_progress),
+            "saved_progress": saved_progress,
+            "known_duplicates": len(dedupe_state.get("fingerprints", [])),
+            "warnings": warnings,
+        }
 
     # ── Connection ──
 
-    def _test_connection_latency(self):
-        dc_ips_v4 = ["149.154.175.53", "149.154.167.51", "149.154.175.100"]
-        dc_ips_v6 = ["2001:0b28:f23d:f001::a", "2001:067c:04e8:f002::a"]
-
-        def test_ip(ip, port=443, family=socket.AF_INET):
-            times = []
-            for _ in range(3):
-                try:
-                    s = socket.socket(family, socket.SOCK_STREAM)
-                    s.settimeout(3)
-                    start = time.time()
-                    s.connect((ip, port))
-                    elapsed = (time.time() - start) * 1000
-                    times.append(elapsed)
-                    s.close()
-                except Exception:
-                    times.append(float('inf'))
-            return sum(times) / len(times) if times else float('inf')
-
-        avg_ipv4 = min((test_ip(ip) for ip in dc_ips_v4), default=float('inf'))
-        avg_ipv6 = float('inf')
-        try:
-            avg_ipv6 = min((test_ip(ip, family=socket.AF_INET6) for ip in dc_ips_v6), default=float('inf'))
-        except Exception:
-            pass
-
-        use_ipv6 = avg_ipv6 < avg_ipv4 and avg_ipv6 != float('inf')
-        return use_ipv6, avg_ipv4, avg_ipv6
-
-    async def _create_client(self, api_id, api_hash):
+    async def _dispose_client(self):
         if self.client:
             try:
                 await self.client.disconnect()
             except Exception:
                 pass
-            self.client = None
-        self.log("Testando latência IPv4 vs IPv6...", "info")
-        use_ipv6, avg_ipv4, avg_ipv6 = self._test_connection_latency()
+        self.client = None
+        self.logged_in = False
 
-        ipv4_str = f"{avg_ipv4:.0f}ms" if avg_ipv4 != float('inf') else "N/A"
-        ipv6_str = f"{avg_ipv6:.0f}ms" if avg_ipv6 != float('inf') else "N/A"
-        protocol = "IPv6" if use_ipv6 else "IPv4"
-        self.log(f"Latência: IPv4={ipv4_str}, IPv6={ipv6_str} → Usando {protocol}", "info")
+    def _get_local_session_paths(self):
+        base = Path(f"{self.session_base_path}.session")
+        return [
+            base,
+            Path(f"{base}-journal"),
+            Path(f"{base}-wal"),
+            Path(f"{base}-shm"),
+        ]
+
+    def _has_local_session_file(self):
+        return any(path.exists() for path in self._get_local_session_paths())
+
+    def _clear_local_session_files(self):
+        removed = False
+        for path in self._get_local_session_paths():
+            try:
+                if path.exists():
+                    path.unlink()
+                    removed = True
+            except Exception as exc:
+                self.log(f"Não foi possível remover {path.name}: {exc}", "warning")
+        return removed
+
+    def _export_session_string(self):
+        if not self.client or not getattr(self.client, "session", None):
+            return ""
+        try:
+            return StringSession.save(self.client.session) or ""
+        except Exception as exc:
+            self.log(f"Falha ao exportar a session_string: {exc}", "warning")
+            return ""
+
+    def _build_user_payload(self, me):
+        return {
+            "name": me.first_name or "",
+            "username": me.username,
+        }
+
+    async def _complete_login(self, log_prefix):
+        self.logged_in = True
+        me = await self.client.get_me()
+        user = self._build_user_payload(me)
+        username = f"(@{user['username']})" if user.get("username") else ""
+        identity = f"{user['name']} {username}".strip()
+        self.log(f"{log_prefix}: {identity}", "success")
+        self.emit_status("connected")
+        return {
+            "ok": True,
+            "user": user,
+            "session_string": self._export_session_string(),
+        }
+
+    def _normalize_session_string(self, session_string=""):
+        return (session_string or "").strip()
+
+    def _has_saved_session_candidates(self, session_string=""):
+        return bool(self._normalize_session_string(session_string) or self._has_local_session_file())
+
+    def _build_saved_session_candidates(self, session_string=""):
+        normalized_session = self._normalize_session_string(session_string)
+        candidates = []
+
+        if normalized_session:
+            candidates.append({
+                "kind": "string",
+                "session_string": normalized_session,
+                "prefer_disk_session": False,
+            })
+
+        if self._has_local_session_file():
+            candidates.append({
+                "kind": "disk",
+                "session_string": "",
+                "prefer_disk_session": True,
+            })
+
+        return candidates
+
+    async def _try_saved_session_login(self, api_id, api_hash, session_string=""):
+        invalid_sources = []
+        last_error = None
+
+        for candidate in self._build_saved_session_candidates(session_string):
+            kind = candidate["kind"]
+            try:
+                await self._create_client(
+                    api_id,
+                    api_hash,
+                    session_string=candidate["session_string"],
+                    prefer_disk_session=candidate["prefer_disk_session"],
+                )
+                if await self.client.is_user_authorized():
+                    return {
+                        "ok": True,
+                        "source": kind,
+                        "invalid_sources": invalid_sources,
+                        "last_error": last_error,
+                    }
+                self.log(f"Sessão armazenada ({kind}) não está mais autorizada.", "warning")
+            except Exception as exc:
+                last_error = exc
+                self.log(f"Falha ao abrir a sessão armazenada ({kind}): {exc}", "warning")
+
+            invalid_sources.append(kind)
+            await self._dispose_client()
+
+        return {
+            "ok": False,
+            "invalid_sources": invalid_sources,
+            "last_error": last_error,
+        }
+
+    def _clear_invalid_session_sources(self, invalid_sources):
+        normalized = set(invalid_sources or [])
+        cleared_local_session = False
+
+        if "disk" in normalized:
+            cleared_local_session = self._clear_local_session_files()
+
+        return {
+            "reset_session": "string" in normalized,
+            "cleared_local_session": cleared_local_session,
+            "cleared_sources": sorted(normalized),
+        }
+
+    async def _recover_clean_session_client(self, api_id, api_hash, reason):
+        self.log(reason, "warning")
+        return False
+
+    async def _create_client(self, api_id, api_hash, session_string="", prefer_disk_session=False):
+        await self._dispose_client()
+        session_string = self._normalize_session_string(session_string)
+
+        if session_string:
+            session = StringSession(session_string)
+        elif prefer_disk_session and self._has_local_session_file():
+            session = str(self.session_base_path)
+        else:
+            session = StringSession()
 
         self.client = TelegramClient(
-            "haumea_session", api_id, api_hash,
+            session,
+            api_id,
+            api_hash,
             timeout=self.connect_timeout,
             connection_retries=2,
             retry_delay=1,
             flood_sleep_threshold=120,
-            use_ipv6=use_ipv6
+            use_ipv6=False
         )
         try:
             await asyncio.wait_for(self.client.connect(), timeout=self.connect_timeout)
-        except asyncio.TimeoutError:
-            self.log("Timeout ao conectar no Telegram. Verifique rede, IPv4/IPv6 ou API ID/API Hash.", "error")
+        except asyncio.TimeoutError as exc:
+            self.log("Timeout ao conectar no Telegram. Verifique sua rede ou as credenciais da API.", "error")
             self.emit_status("disconnected")
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-            self.client = None
-            raise RuntimeError("Timeout ao conectar no Telegram")
+            await self._dispose_client()
+            raise RuntimeError("Timeout ao conectar no Telegram") from exc
         except Exception:
             self.emit_status("disconnected")
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-            self.client = None
+            await self._dispose_client()
             raise
 
-    async def rpc_connect(self, api_id="", api_hash="", phone="", password=""):
+    async def rpc_connect(self, api_id="", api_hash="", phone="", password="", session_string=""):
         self.emit_status("connecting")
         api_id = int(api_id)
-        await self._create_client(api_id, api_hash)
+        session_string = self._normalize_session_string(session_string)
+        session_reset = False
+
+        if self._has_saved_session_candidates(session_string):
+            saved_login = await self._try_saved_session_login(api_id, api_hash, session_string=session_string)
+            if saved_login.get("ok"):
+                result = await self._complete_login("Conectado como")
+                result["needs_code"] = False
+                result["reset_session"] = False
+                result["cleared_local_session"] = False
+                return result
+
+            cleanup = self._clear_invalid_session_sources(saved_login.get("invalid_sources"))
+            session_reset = cleanup["reset_session"]
+            cleared_local_session = cleanup["cleared_local_session"]
+
+            await self._create_client(api_id, api_hash, session_string="", prefer_disk_session=False)
+
+            if not await self.client.is_user_authorized():
+                self.log("Enviando código de verificação...", "info")
+                await self.client.send_code_request(phone)
+                self.emit_status("awaiting_code")
+                return {
+                    "ok": True,
+                    "needs_code": True,
+                    "reset_session": session_reset,
+                    "cleared_local_session": cleared_local_session,
+                }
+
+            result = await self._complete_login("Conectado como")
+            result["needs_code"] = False
+            result["reset_session"] = session_reset
+            result["cleared_local_session"] = cleared_local_session
+            return result
+
+        try:
+            await self._create_client(
+                api_id,
+                api_hash,
+                session_string=session_string,
+                prefer_disk_session=not bool(session_string),
+            )
+        except Exception:
+            if (session_string or self._has_local_session_file()) and await self._recover_clean_session_client(
+                api_id,
+                api_hash,
+                "Sessão armazenada falhou. Recriando uma sessão limpa sem exigir deleção manual...",
+            ):
+                session_reset = True
+            else:
+                raise
 
         if not await self.client.is_user_authorized():
             self.log("Enviando código de verificação...", "info")
             await self.client.send_code_request(phone)
             self.emit_status("awaiting_code")
-            return {"ok": True, "needs_code": True}
+            return {"ok": True, "needs_code": True, "reset_session": session_reset}
 
-        self.logged_in = True
-        me = await self.client.get_me()
-        name = me.first_name or ""
-        username = f"(@{me.username})" if me.username else ""
-        self.log(f"Conectado como: {name} {username}", "success")
-        self.emit_status("connected")
-        return {"ok": True, "needs_code": False, "user": {"name": name, "username": me.username}}
+        result = await self._complete_login("Conectado como")
+        result["needs_code"] = False
+        result["reset_session"] = session_reset
+        return result
 
     async def rpc_submit_code(self, phone="", code="", password=""):
         try:
@@ -351,49 +927,92 @@ class HaumeaServer:
                 return {"ok": True, "needs_2fa": True}
             await self.client.sign_in(password=password)
 
-        self.logged_in = True
-        me = await self.client.get_me()
-        name = me.first_name or ""
-        username = f"(@{me.username})" if me.username else ""
-        self.log(f"Conectado como: {name} {username}", "success")
-        self.emit_status("connected")
-        return {"ok": True, "user": {"name": name, "username": me.username}}
+        return await self._complete_login("Conectado como")
 
     async def rpc_submit_2fa(self, password=""):
         await self.client.sign_in(password=password)
-        self.logged_in = True
-        me = await self.client.get_me()
-        name = me.first_name or ""
-        username = f"(@{me.username})" if me.username else ""
-        self.log(f"Conectado como: {name} {username}", "success")
-        self.emit_status("connected")
-        return {"ok": True, "user": {"name": name, "username": me.username}}
+        return await self._complete_login("Conectado como")
 
-    async def rpc_auto_login(self, api_id="", api_hash=""):
-        session_file = Path("haumea_session.session")
-        if not session_file.exists():
+    async def rpc_auto_login(self, api_id="", api_hash="", session_string=""):
+        session_string = self._normalize_session_string(session_string)
+        if self._has_saved_session_candidates(session_string):
+            api_id = int(api_id)
+            self.emit_status("connecting")
+
+            saved_login = await self._try_saved_session_login(api_id, api_hash, session_string=session_string)
+            if saved_login.get("ok"):
+                result = await self._complete_login("Login automático")
+                result["reset_session"] = False
+                result["cleared_local_session"] = False
+                return result
+
+            cleanup = self._clear_invalid_session_sources(saved_login.get("invalid_sources"))
+            await self._dispose_client()
             self.emit_status("disconnected")
-            return {"ok": False, "error": "No session file"}
+            if cleanup["reset_session"] or cleanup["cleared_local_session"]:
+                self.log("A sessão salva ficou inválida. Limpe a sessão local e faça um novo login.", "warning")
+
+            return {
+                "ok": False,
+                "error": "Session expired" if saved_login.get("invalid_sources") else str(saved_login.get("last_error") or "Session expired"),
+                "needs_reauth": bool(saved_login.get("invalid_sources")),
+                "reset_session": cleanup["reset_session"],
+                "cleared_local_session": cleanup["cleared_local_session"],
+            }
+
+        has_disk_session = self._has_local_session_file()
+        if not session_string and not has_disk_session:
+            self.emit_status("disconnected")
+            return {"ok": False, "error": "No stored session", "needs_reauth": False, "reset_session": False}
 
         api_id = int(api_id)
         self.emit_status("connecting")
-        await self._create_client(api_id, api_hash)
+
+        try:
+            await self._create_client(
+                api_id,
+                api_hash,
+                session_string=session_string,
+                prefer_disk_session=not bool(session_string),
+            )
+        except Exception as exc:
+            recovered = False
+            if session_string or has_disk_session:
+                recovered = await self._recover_clean_session_client(
+                    api_id,
+                    api_hash,
+                    "Sessão automática inválida ou travada. Limpando a sessão local e preparando um novo handshake...",
+                )
+            await self._dispose_client()
+            self.emit_status("disconnected")
+            if recovered:
+                return {"ok": False, "error": "Stored session reset", "needs_reauth": True, "reset_session": True}
+            return {"ok": False, "error": str(exc), "needs_reauth": False, "reset_session": False}
 
         if await self.client.is_user_authorized():
-            self.logged_in = True
-            me = await self.client.get_me()
-            name = me.first_name or ""
-            username = f"(@{me.username})" if me.username else ""
-            self.log(f"Login automático: {name} {username}", "success")
-            self.emit_status("connected")
-            return {"ok": True, "user": {"name": name, "username": me.username}}
-        else:
-            await self.client.disconnect()
-            self.client = None
-            self.emit_status("disconnected")
-            return {"ok": False, "error": "Session expired"}
+            return await self._complete_login("Login automático")
+
+        await self._dispose_client()
+        self._clear_local_session_files()
+        self.emit_status("disconnected")
+        return {"ok": False, "error": "Session expired", "needs_reauth": True, "reset_session": True}
 
     # ── Entity Resolution ──
+
+    async def rpc_clear_session(self):
+        if self.runtime_state.get("active_job") or self.sync_state.get("active"):
+            raise Exception("Pare as operações ativas antes de limpar a sessão.")
+
+        await self._dispose_client()
+        cleared_local_session = self._clear_local_session_files()
+        self._dialogs_cached = False
+        self.emit_status("disconnected")
+        self.log("Sessão local removida. Inicie um novo handshake para entrar novamente.", "warning")
+        return {
+            "ok": True,
+            "reset_session": True,
+            "cleared_local_session": cleared_local_session,
+        }
 
     async def resolve_entity(self, identifier):
         identifier = str(identifier).strip()
@@ -466,6 +1085,47 @@ class HaumeaServer:
         entity = await self.resolve_entity(parsed["entity"])
         return entity, parsed["topic_id"]
 
+    async def _get_forum_input_channel(self, entity, label="grupo"):
+        resolved = entity
+        try:
+            resolved = await self.client.get_entity(entity)
+        except Exception:
+            pass
+
+        if isinstance(resolved, ChannelForbidden):
+            raise ValueError(
+                f"A conta conectada não consegue acessar o {label}. Entre no grupo com esta conta e tente novamente."
+            )
+
+        if not isinstance(resolved, Channel):
+            raise ValueError(
+                f"O {label} precisa ser um supergrupo do Telegram. Grupos básicos não suportam tópicos."
+            )
+
+        if not getattr(resolved, "megagroup", False):
+            raise ValueError(
+                f"O {label} precisa ser um supergrupo do Telegram para usar tópicos."
+            )
+
+        if not getattr(resolved, "forum", False):
+            raise ValueError(
+                f"O {label} precisa ter o modo fórum/tópicos ativado antes da clonagem."
+            )
+
+        try:
+            input_channel = get_input_channel(resolved)
+        except TypeError as exc:
+            raise ValueError(
+                f"Não foi possível resolver o canal do {label}. Abra o grupo pelo menos uma vez com esta conta e tente novamente."
+            ) from exc
+
+        if not isinstance(input_channel, InputChannel):
+            raise ValueError(
+                f"O {label} não foi resolvido como um canal válido para criação de tópicos."
+            )
+
+        return input_channel
+
     def get_iter_messages_kwargs(self, limit=0, reverse=False, reply_to=None, min_id=None):
         kwargs = {
             "limit": None if limit == 0 else limit,
@@ -526,7 +1186,134 @@ class HaumeaServer:
                     return True
         return False
 
+    def _is_media_file(self, message):
+        media = getattr(message, "media", None)
+        if not media:
+            return False
+        return not isinstance(
+            media,
+            (
+                MessageMediaWebPage,
+                MessageMediaContact,
+                MessageMediaGeo,
+                MessageMediaGeoLive,
+                MessageMediaVenue,
+                MessageMediaPoll,
+                MessageMediaGame,
+                MessageMediaInvoice,
+                MessageMediaDice,
+                MessageMediaUnsupported,
+            ),
+        )
+
+    def _is_restricted_forward_error(self, exc):
+        error_text = f"{type(exc).__name__} {exc}".lower()
+        restricted_tokens = (
+            "protected",
+            "forwards restricted",
+            "message_protected",
+            "chatforwardsrestricted",
+            "chat_forwards_restricted",
+            "cannot be forwarded",
+        )
+        return any(token in error_text for token in restricted_tokens)
+
+    def _extract_media_attributes(self, msg):
+        attributes = getattr(msg.media, "attributes", None)
+        document = getattr(msg.media, "document", None)
+        if document:
+            attributes = getattr(document, "attributes", None) or attributes
+        return list(attributes) if attributes else None
+
+    def _guess_media_filename(self, msg):
+        if isinstance(msg.media, MessageMediaPhoto):
+            return f"photo_{msg.id}.jpg"
+
+        message_file = getattr(msg, "file", None)
+        file_name = getattr(message_file, "name", None)
+        if file_name:
+            return file_name
+
+        document = getattr(msg.media, "document", None)
+        if document:
+            for attr in document.attributes or []:
+                if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
+                    return attr.file_name
+
+        ext = getattr(message_file, "ext", None)
+        if not ext:
+            mime_type = getattr(document, "mime_type", None)
+            mime_extensions = {
+                "application/x-tgsticker": ".tgs",
+                "audio/ogg": ".ogg",
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+                "video/mp4": ".mp4",
+                "video/webm": ".webm",
+            }
+            ext = mime_extensions.get(mime_type) or mimetypes.guess_extension(mime_type or "") or ".bin"
+        if not str(ext).startswith("."):
+            ext = f".{ext}"
+        return f"media_{msg.id}{ext}"
+
+    async def _run_with_floodwait_retry(self, coro_func, *args, action="operação", **kwargs):
+        while True:
+            try:
+                return await coro_func(*args, **kwargs)
+            except FloodWaitError as exc:
+                wait_seconds = max(int(getattr(exc, "seconds", 0) or 0), 1) + 2
+                self.log(f"FloodWait durante {action}: aguardando {wait_seconds}s para retry...", "warning")
+                await asyncio.sleep(wait_seconds)
+
+    async def _send_media_via_ram_bypass(self, dest_entity, msg, reply_to=None):
+        if not msg.media:
+            return False
+
+        self._last_send_used_ram_bypass = True
+        self.log("Protegido detectado -> baixando na RAM e reenviando", "warning")
+        attributes = self._extract_media_attributes(msg)
+        download_action = f"download em RAM da msg #{msg.id}"
+        upload_action = f"reupload em RAM da msg #{msg.id}"
+        bytes_data = await self._run_with_floodwait_retry(
+            self.client.download_media,
+            msg,
+            file=bytes,
+            action=download_action,
+        )
+        if not bytes_data:
+            raise Exception(f"Falha ao baixar a mídia protegida da msg #{msg.id} em memória")
+
+        # Reenvia a mídia a partir da RAM para evitar I/O em disco e preservar os metadados originais.
+        upload_buffer = io.BytesIO(bytes_data)
+        upload_buffer.name = self._guess_media_filename(msg)
+        kwargs = {
+            "caption": msg.message or "",
+            "formatting_entities": msg.entities,
+            "parse_mode": None,
+            "attributes": attributes,
+            "force_document": isinstance(msg.media, MessageMediaDocument) and not self._is_visual_media(msg.media),
+        }
+        if reply_to:
+            kwargs["reply_to"] = reply_to
+        if attributes:
+            kwargs["voice_note"] = any(isinstance(attr, DocumentAttributeAudio) and attr.voice for attr in attributes)
+            kwargs["video_note"] = any(isinstance(attr, DocumentAttributeVideo) and attr.round_message for attr in attributes)
+            kwargs["supports_streaming"] = any(
+                isinstance(attr, DocumentAttributeVideo) and not attr.round_message
+                for attr in attributes
+            )
+
+        await self._run_with_floodwait_retry(
+            self.client.send_file,
+            dest_entity,
+            upload_buffer,
+            action=upload_action,
+            **kwargs,
+        )
+        return True
+
     async def _send_message_like_main(self, dest_entity, msg, reply_to=None):
+        self._last_send_used_ram_bypass = False
         kwargs = {}
         if reply_to:
             kwargs["reply_to"] = reply_to
@@ -561,16 +1348,26 @@ class HaumeaServer:
                     return True
                 return False
 
-            await self.client.send_file(
-                dest_entity,
-                msg.media,
-                caption=msg.message or "",
-                formatting_entities=msg.entities,
-                parse_mode=None,
-                force_document=isinstance(msg.media, MessageMediaDocument) and not self._is_visual_media(msg.media),
-                **kwargs,
-            )
-            return True
+            if getattr(msg, "noforwards", False):
+                self.log(f"Bypass RAM ativado para msg protegida #{msg.id}", "warning")
+                return await self._send_media_via_ram_bypass(dest_entity, msg, reply_to=reply_to)
+
+            try:
+                await self.client.send_file(
+                    dest_entity,
+                    msg.media,
+                    caption=msg.message or "",
+                    formatting_entities=msg.entities,
+                    parse_mode=None,
+                    force_document=isinstance(msg.media, MessageMediaDocument) and not self._is_visual_media(msg.media),
+                    **kwargs,
+                )
+                return True
+            except Exception as exc:
+                if self._is_restricted_forward_error(exc):
+                    self.log(f"Bypass RAM ativado para msg #{msg.id} após bloqueio: {exc}", "warning")
+                    return await self._send_media_via_ram_bypass(dest_entity, msg, reply_to=reply_to)
+                raise
 
         if msg.message:
             await self.client.send_message(
@@ -584,29 +1381,21 @@ class HaumeaServer:
 
         return False
 
-    async def _send_downloaded_media_like_main(self, dest_entity, file_path, msg, reply_to=None,
-                                               progress_callback=None, original_filename=None):
-        kwargs = {
-            "caption": msg.message or "",
-            "formatting_entities": msg.entities,
-            "parse_mode": None,
-        }
-        if reply_to:
-            kwargs["reply_to"] = reply_to
+    async def _deliver_message_with_refresh(self, source_entity, dest_entity, msg, reply_to=None):
+        try:
+            sent = await self._send_message_like_main(dest_entity, msg, reply_to=reply_to)
+            return sent, msg
+        except Exception as exc:
+            if not is_file_reference_error(exc):
+                raise
 
-        is_visual = self._is_visual_media(msg.media)
-        file_attributes = None
-        if original_filename and not is_visual:
-            file_attributes = [DocumentAttributeFilename(file_name=original_filename)]
+            refreshed = await self.client.get_messages(source_entity, ids=[msg.id])
+            refreshed_msg = refreshed[0] if refreshed and refreshed[0] else None
+            if not refreshed_msg:
+                raise
 
-        await self.client.send_file(
-            dest_entity,
-            file_path,
-            force_document=not is_visual,
-            attributes=file_attributes,
-            progress_callback=progress_callback,
-            **kwargs,
-        )
+            sent = await self._send_message_like_main(dest_entity, refreshed_msg, reply_to=reply_to)
+            return sent, refreshed_msg
 
     def _format_bytes(self, bytes_value):
         if bytes_value < 1024: return f"{bytes_value} B"
@@ -635,7 +1424,13 @@ class HaumeaServer:
         hash_key = hashlib.md5(key.encode()).hexdigest()[:12]
         return self.progress_dir / f"clone_{hash_key}.json"
 
-    def save_progress(self, source, dest, last_msg_id, cloned, total, source_title, dest_title):
+    def get_saved_progress_entry(self, source, dest):
+        progress_file = self.get_progress_filename(source, dest)
+        if not progress_file.exists():
+            return None
+        return self._load_json_file(progress_file, None)
+
+    def save_progress(self, source, dest, last_msg_id, cloned, total, source_title, dest_title, extra=None):
         pf = self.get_progress_filename(source, dest)
         data = {
             "source": source, "dest": dest,
@@ -643,6 +1438,8 @@ class HaumeaServer:
             "last_message_id": last_msg_id, "cloned": cloned, "total": total,
             "timestamp": datetime.now().isoformat(),
         }
+        if extra:
+            data.update(extra)
         pf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def delete_progress_file(self, source, dest):
@@ -652,29 +1449,68 @@ class HaumeaServer:
 
     # ── Clone Operations ──
 
-    async def rpc_clone(self, source="", dest="", limit=0, delay=0.1,
-                        pause_every=50, pause_duration=2, resume_from_msg_id=None):
+    async def rpc_clone(
+        self,
+        source="",
+        dest="",
+        limit=0,
+        delay=0.1,
+        pause_every=50,
+        pause_duration=2,
+        pause_every_min=None,
+        pause_every_max=None,
+        pause_duration_min=None,
+        pause_duration_max=None,
+        resume_from_msg_id=None,
+    ):
         if not self.logged_in:
             raise Exception("Não conectado ao Telegram")
 
         self.stop_flag = False
         self._dialogs_cached = False
+        started_at = datetime.now().isoformat()
+        config = self.rpc_load_config()
+        dedupe_enabled = config.get("dedupe_enabled", True)
+        dedupe_state = self.load_dedupe_state(source, dest) if dedupe_enabled else None
+        anti_flood = self._resolve_anti_flood_config(
+            pause_every=pause_every,
+            pause_duration=pause_duration,
+            pause_every_min=pause_every_min,
+            pause_every_max=pause_every_max,
+            pause_duration_min=pause_duration_min,
+            pause_duration_max=pause_duration_max,
+        )
+        skipped_duplicates = 0
+
         self.emit_progress({"type": "clone", "status": "starting"})
         self.log("Resolvendo entidades...", "info")
 
         source_entity, source_topic_id = await self.resolve_target(source)
         dest_entity, dest_topic_id = await self.resolve_target(dest)
 
-        source_title = getattr(source_entity, 'title', str(source))
-        dest_title = getattr(dest_entity, 'title', str(dest))
+        source_title = getattr(source_entity, "title", str(source))
+        dest_title = getattr(dest_entity, "title", str(dest))
         if source_topic_id:
             source_title = f"{source_title} > tópico {source_topic_id}"
         if dest_topic_id:
             dest_title = f"{dest_title} > tópico {dest_topic_id}"
         self.log(f"Origem: {source_title}", "info")
         self.log(f"Destino: {dest_title}", "info")
+        self._set_active_job("clone", {
+            "status": "starting",
+            "source_title": source_title,
+            "dest_title": dest_title,
+            "source": source,
+            "dest": dest,
+            "started_at": started_at,
+            "processed": 0,
+            "media_files": 0,
+            "ram_bypass_used": 0,
+            "total": 0,
+            "errors": 0,
+            "skipped_duplicates": 0,
+        })
 
-        # Count messages
         total = 0
         async for _ in self.client.iter_messages(
             source_entity,
@@ -686,9 +1522,28 @@ class HaumeaServer:
         if total == 0:
             self.log("Nenhuma mensagem encontrada!", "warning")
             self.emit_progress({"type": "clone", "status": "done", "cloned": 0, "total": 0})
+            self._finish_active_job({
+                "operation": "clone",
+                "status": "success",
+                "source_title": source_title,
+                "dest_title": dest_title,
+                "source": source,
+                "dest": dest,
+                "processed": 0,
+                "media_files": 0,
+                "ram_bypass_used": 0,
+                "total": 0,
+                "errors": 0,
+                "skipped_duplicates": 0,
+                "messages_per_minute": 0,
+            })
             return {"ok": True, "cloned": 0}
 
-        # Collect messages (oldest first)
+        resume_entry = self.get_saved_progress_entry(source, dest) if resume_from_msg_id else None
+        resume_offset = int((resume_entry or {}).get("cloned", 0) or 0)
+        media_files = int((resume_entry or {}).get("media_files", 0) or 0)
+        ram_bypass_used = int((resume_entry or {}).get("ram_bypass_used", 0) or 0)
+
         messages = []
         async for msg in self.client.iter_messages(
             source_entity,
@@ -703,78 +1558,491 @@ class HaumeaServer:
 
         cloned = 0
         errors = 0
-        for i, msg in enumerate(messages):
+        completed = resume_offset
+        last_completed_msg_id = int(resume_from_msg_id or 0)
+        total_scope = total
+        loop_started_at = time.time()
+        anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
+
+        for msg in messages:
             if self.stop_flag:
                 self.log("Clonagem interrompida!", "warning")
-                self.save_progress(source, dest, msg.id, cloned, total, source_title, dest_title)
+                self.save_progress(
+                    source,
+                    dest,
+                    last_completed_msg_id,
+                    completed,
+                    total_scope,
+                    source_title,
+                    dest_title,
+                    {"media_files": media_files, "ram_bypass_used": ram_bypass_used},
+                )
                 break
 
             try:
                 media_type = self.get_media_type(msg)
 
-                sent = await self._send_message_like_main(dest_entity, msg, reply_to=dest_topic_id)
+                if dedupe_enabled and self.is_duplicate_message(dedupe_state, msg):
+                    skipped_duplicates += 1
+                    completed += 1
+                    last_completed_msg_id = msg.id
+                    metrics = self._build_runtime_metrics(loop_started_at, completed, total_scope)
+                    self.emit_progress({
+                        "type": "clone",
+                        "status": "running",
+                        "cloned": completed,
+                        "total": total_scope,
+                        "percent": int((completed / total_scope) * 100) if total_scope else 0,
+                        "media_type": media_type,
+                        "media_files": media_files,
+                        "ram_bypass_used": ram_bypass_used,
+                        "skipped_duplicates": skipped_duplicates,
+                        **metrics,
+                    })
+                    self._set_active_job("clone", {
+                        "status": "running",
+                        "source_title": source_title,
+                        "dest_title": dest_title,
+                        "source": source,
+                        "dest": dest,
+                        "started_at": started_at,
+                        "processed": completed,
+                        "media_files": media_files,
+                        "ram_bypass_used": ram_bypass_used,
+                        "total": total_scope,
+                        "errors": errors,
+                        "skipped_duplicates": skipped_duplicates,
+                        **metrics,
+                    })
+                    continue
+
+                sent, delivered_msg = await self._deliver_message_with_refresh(
+                    source_entity,
+                    dest_entity,
+                    msg,
+                    reply_to=dest_topic_id,
+                )
                 if not sent:
                     cloned += 1
+                    completed += 1
+                    last_completed_msg_id = msg.id
+                    if dedupe_enabled:
+                        self.mark_message_deduped(dedupe_state, msg)
                     continue
 
                 cloned += 1
-                pct = int((cloned / total) * 100) if total else 0
+                completed += 1
+                last_completed_msg_id = msg.id
+                if self._is_media_file(delivered_msg):
+                    media_files += 1
+                if self._last_send_used_ram_bypass:
+                    ram_bypass_used += 1
+                if dedupe_enabled:
+                    self.mark_message_deduped(dedupe_state, msg)
+                pct = int((completed / total_scope) * 100) if total_scope else 0
+                metrics = self._build_runtime_metrics(loop_started_at, completed, total_scope)
                 self.emit_progress({
-                    "type": "clone", "status": "running",
-                    "cloned": cloned, "total": total, "percent": pct,
+                    "type": "clone",
+                    "status": "running",
+                    "cloned": completed,
+                    "total": total_scope,
+                    "percent": pct,
                     "media_type": media_type,
+                    "media_files": media_files,
+                    "ram_bypass_used": ram_bypass_used,
+                    "skipped_duplicates": skipped_duplicates,
+                    **metrics,
+                })
+                self._set_active_job("clone", {
+                    "status": "running",
+                    "source_title": source_title,
+                    "dest_title": dest_title,
+                    "source": source,
+                    "dest": dest,
+                    "started_at": started_at,
+                    "processed": completed,
+                    "media_files": media_files,
+                    "ram_bypass_used": ram_bypass_used,
+                    "total": total_scope,
+                    "errors": errors,
+                    "skipped_duplicates": skipped_duplicates,
+                    **metrics,
                 })
 
-                if cloned % 10 == 0:
-                    self.log(f"Progresso: {cloned}/{total} ({pct}%)", "info")
-                    self.save_progress(source, dest, msg.id, cloned, total, source_title, dest_title)
+                if completed % 10 == 0:
+                    self.log(f"Progresso: {completed}/{total_scope} ({pct}%)", "info")
+                    self.save_progress(
+                        source,
+                        dest,
+                        last_completed_msg_id,
+                        completed,
+                        total_scope,
+                        source_title,
+                        dest_title,
+                        {"media_files": media_files, "ram_bypass_used": ram_bypass_used},
+                    )
+                    if dedupe_enabled:
+                        dedupe_state = self.save_dedupe_state(source, dest, dedupe_state)
 
-                if pause_every > 0 and cloned % pause_every == 0:
-                    self.log(f"Anti-flood: pausando {pause_duration}s...", "warning")
-                    await asyncio.sleep(pause_duration)
+                if anti_flood_cycle and cloned >= anti_flood_cycle["after_messages"]:
+                    pause_seconds = anti_flood_cycle["duration"]
+                    self.log(
+                        f"Proteção local: pausando {self._format_seconds(pause_seconds)}s "
+                        f"após {anti_flood_cycle['frequency']} envios neste ciclo.",
+                        "warning",
+                    )
+                    await asyncio.sleep(pause_seconds)
+                    anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
 
                 await asyncio.sleep(delay)
 
             except FloodWaitError as e:
                 wait = e.seconds + 5
                 self.log(f"FloodWait: aguardando {wait}s...", "error")
-                self.save_progress(source, dest, msg.id, cloned, total, source_title, dest_title)
+                self._record_error(e, "clone", {"source": source_title, "dest": dest_title, "message_id": msg.id})
+                self.save_progress(
+                    source,
+                    dest,
+                    last_completed_msg_id,
+                    completed,
+                    total_scope,
+                    source_title,
+                    dest_title,
+                    {"media_files": media_files, "ram_bypass_used": ram_bypass_used},
+                )
                 await asyncio.sleep(wait)
+                anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
             except Exception as e:
-                if is_file_reference_error(e):
-                    try:
-                        refreshed = await self.client.get_messages(source_entity, ids=[msg.id])
-                        if refreshed and refreshed[0]:
-                            rmsg = refreshed[0]
-                            if await self._send_message_like_main(dest_entity, rmsg, reply_to=dest_topic_id):
-                                cloned += 1
-                                continue
-                    except Exception:
-                        pass
                 errors += 1
+                self._record_error(e, "clone", {"source": source_title, "dest": dest_title, "message_id": msg.id})
                 self.log(f"Erro msg #{msg.id}: {e}", "error")
 
-        self.delete_progress_file(source, dest)
-        self.log(f"Clonagem concluída! {cloned}/{total} mensagens, {errors} erros", "success")
-        self.emit_progress({"type": "clone", "status": "done", "cloned": cloned, "total": total, "errors": errors})
-        return {"ok": True, "cloned": cloned, "total": total, "errors": errors}
+        if dedupe_enabled:
+            dedupe_state = self.save_dedupe_state(source, dest, dedupe_state)
+
+        metrics = self._build_runtime_metrics(loop_started_at, completed, total_scope)
+        status = "stopped" if self.stop_flag else "success"
+        if not self.stop_flag:
+            self.delete_progress_file(source, dest)
+        self.log(
+            f"Clonagem concluída! {completed}/{total_scope} mensagens, {errors} erros, {skipped_duplicates} duplicadas",
+            "success" if not self.stop_flag else "warning",
+        )
+        self.emit_progress({
+            "type": "clone",
+            "status": "done" if not self.stop_flag else "stopped",
+            "cloned": completed,
+            "total": total_scope,
+            "media_files": media_files,
+            "ram_bypass_used": ram_bypass_used,
+            "errors": errors,
+            "skipped_duplicates": skipped_duplicates,
+            **metrics,
+        })
+        self._append_history_entry(self._create_history_entry(
+            "clone",
+            status,
+            source,
+            dest,
+            source_title,
+            dest_title,
+            started_at,
+            cloned=completed,
+            total=total_scope,
+            media_files=media_files,
+            ram_bypass_used=ram_bypass_used,
+            errors=errors,
+            skipped_duplicates=skipped_duplicates,
+            messages_per_minute=metrics["messages_per_minute"],
+        ))
+        self._finish_active_job({
+            "operation": "clone",
+            "status": status,
+            "source_title": source_title,
+            "dest_title": dest_title,
+            "source": source,
+            "dest": dest,
+            "processed": completed,
+            "media_files": media_files,
+            "ram_bypass_used": ram_bypass_used,
+            "total": total_scope,
+            "errors": errors,
+            "skipped_duplicates": skipped_duplicates,
+            **metrics,
+        })
+        return {
+            "ok": True,
+            "cloned": completed,
+            "total": total_scope,
+            "media_files": media_files,
+            "ram_bypass_used": ram_bypass_used,
+            "errors": errors,
+            "skipped_duplicates": skipped_duplicates,
+            "status": status,
+        }
 
     async def rpc_stop(self):
         self.stop_flag = True
         self.log("Parando clonagem...", "warning")
         return {"ok": True}
 
-    async def rpc_skip_download(self):
-        self.skip_current_file = True
-        self.log("Pulando arquivo atual...", "warning")
-        return {"ok": True}
+    async def _live_sync_loop(self, source, dest, source_entity, dest_entity, source_title, dest_title,
+                              source_topic_id, dest_topic_id, poll_interval, delay, dedupe_state, anti_flood):
+        anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, self.sync_state.get("processed", 0))
+        while self.sync_state.get("active"):
+            try:
+                messages = []
+                async for msg in self.client.iter_messages(
+                    source_entity,
+                    **self.get_iter_messages_kwargs(
+                        limit=0,
+                        reverse=True,
+                        reply_to=source_topic_id,
+                        min_id=self.sync_state.get("last_seen_id") or None,
+                    )
+                ):
+                    messages.append(msg)
+
+                for msg in messages:
+                    if not self.sync_state.get("active"):
+                        break
+                    try:
+                        if dedupe_state and self.is_duplicate_message(dedupe_state, msg):
+                            self.sync_state["skipped_duplicates"] += 1
+                            self.sync_state["last_seen_id"] = max(self.sync_state.get("last_seen_id", 0), msg.id)
+                            continue
+
+                        sent, delivered_msg = await self._deliver_message_with_refresh(
+                            source_entity,
+                            dest_entity,
+                            msg,
+                            reply_to=dest_topic_id,
+                        )
+                        self.sync_state["last_seen_id"] = max(self.sync_state.get("last_seen_id", 0), msg.id)
+                        if sent:
+                            self.sync_state["processed"] += 1
+                            if self._is_media_file(delivered_msg):
+                                self.sync_state["media_files"] += 1
+                            if self._last_send_used_ram_bypass:
+                                self.sync_state["ram_bypass_used"] += 1
+                            if dedupe_state is not None:
+                                self.mark_message_deduped(dedupe_state, msg)
+                            if anti_flood_cycle and self.sync_state["processed"] >= anti_flood_cycle["after_messages"]:
+                                pause_seconds = anti_flood_cycle["duration"]
+                                self.log(
+                                    f"Proteção local: pausando {self._format_seconds(pause_seconds)}s "
+                                    f"após {anti_flood_cycle['frequency']} envios neste ciclo.",
+                                    "warning",
+                                )
+                                await asyncio.sleep(pause_seconds)
+                                anti_flood_cycle = self._next_anti_flood_cycle(
+                                    anti_flood,
+                                    self.sync_state["processed"],
+                                )
+                        metrics = self._build_runtime_metrics(
+                            datetime.fromisoformat(self.sync_state["started_at"]).timestamp(),
+                            self.sync_state["processed"] + self.sync_state["skipped_duplicates"],
+                            max(self.sync_state["processed"] + self.sync_state["skipped_duplicates"], 1),
+                        )
+                        self.emit_progress({
+                            "type": "sync",
+                            "status": "running",
+                            "processed": self.sync_state["processed"],
+                            "media_files": self.sync_state["media_files"],
+                            "ram_bypass_used": self.sync_state["ram_bypass_used"],
+                            "skipped_duplicates": self.sync_state["skipped_duplicates"],
+                            "errors": self.sync_state["errors"],
+                            "poll_interval": poll_interval,
+                            "source_title": source_title,
+                            "dest_title": dest_title,
+                            "last_seen_id": self.sync_state["last_seen_id"],
+                            **metrics,
+                        })
+                        await asyncio.sleep(delay)
+                    except FloodWaitError as e:
+                        self.sync_state["errors"] += 1
+                        self._record_error(e, "sync", {"source": source_title, "dest": dest_title, "message_id": msg.id})
+                        await asyncio.sleep(e.seconds + 5)
+                        anti_flood_cycle = self._next_anti_flood_cycle(
+                            anti_flood,
+                            self.sync_state.get("processed", 0),
+                        )
+                    except Exception as exc:
+                        self.sync_state["errors"] += 1
+                        self._record_error(exc, "sync", {"source": source_title, "dest": dest_title, "message_id": msg.id})
+                        self.log(f"Erro na sync contínua #{msg.id}: {exc}", "error")
+
+                if dedupe_state is not None:
+                    self.save_dedupe_state(source, dest, dedupe_state)
+                self.sync_state["last_poll_at"] = datetime.now().isoformat()
+                self.emit_progress({
+                    "type": "sync",
+                    "status": "idle",
+                    "processed": self.sync_state["processed"],
+                    "media_files": self.sync_state["media_files"],
+                    "ram_bypass_used": self.sync_state["ram_bypass_used"],
+                    "skipped_duplicates": self.sync_state["skipped_duplicates"],
+                    "errors": self.sync_state["errors"],
+                    "poll_interval": poll_interval,
+                    "source_title": source_title,
+                    "dest_title": dest_title,
+                    "last_seen_id": self.sync_state["last_seen_id"],
+                    "last_poll_at": self.sync_state["last_poll_at"],
+                })
+                await asyncio.sleep(poll_interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.sync_state["errors"] += 1
+                self._record_error(exc, "sync", {"source": source_title, "dest": dest_title})
+                self.log(f"Loop de sync falhou: {exc}", "error")
+                await asyncio.sleep(min(max(poll_interval, 5), 15))
+
+    async def rpc_start_live_sync(
+        self,
+        source="",
+        dest="",
+        poll_interval=15,
+        delay=0.2,
+        pause_every=50,
+        pause_duration=2,
+        pause_every_min=None,
+        pause_every_max=None,
+        pause_duration_min=None,
+        pause_duration_max=None,
+    ):
+        if not self.logged_in:
+            raise Exception("Não conectado")
+        if self.sync_task and not self.sync_task.done():
+            return {"ok": False, "error": "Sync contínua já está ativa"}
+
+        self._dialogs_cached = False
+        config = self.rpc_load_config()
+        dedupe_enabled = config.get("dedupe_enabled", True)
+        anti_flood = self._resolve_anti_flood_config(
+            pause_every=pause_every,
+            pause_duration=pause_duration,
+            pause_every_min=pause_every_min,
+            pause_every_max=pause_every_max,
+            pause_duration_min=pause_duration_min,
+            pause_duration_max=pause_duration_max,
+        )
+        dedupe_state = self.load_dedupe_state(source, dest) if dedupe_enabled else None
+
+        source_entity, source_topic_id = await self.resolve_target(source)
+        dest_entity, dest_topic_id = await self.resolve_target(dest)
+        source_title = getattr(source_entity, "title", str(source))
+        dest_title = getattr(dest_entity, "title", str(dest))
+
+        latest_messages = []
+        async for msg in self.client.iter_messages(
+            source_entity,
+            **self.get_iter_messages_kwargs(limit=1, reply_to=source_topic_id)
+        ):
+            latest_messages.append(msg)
+        last_seen_id = latest_messages[0].id if latest_messages else 0
+
+        self.sync_state = {
+            "active": True,
+            "source": source,
+            "dest": dest,
+            "source_title": source_title,
+            "dest_title": dest_title,
+            "processed": 0,
+            "media_files": 0,
+            "ram_bypass_used": 0,
+            "skipped_duplicates": 0,
+            "errors": 0,
+            "poll_interval": int(poll_interval or 15),
+            "delay": float(delay or 0.2),
+            "last_seen_id": last_seen_id,
+            "started_at": datetime.now().isoformat(),
+            "last_poll_at": None,
+        }
+        self.sync_task = asyncio.create_task(self._live_sync_loop(
+            source,
+            dest,
+            source_entity,
+            dest_entity,
+            source_title,
+            dest_title,
+            source_topic_id,
+            dest_topic_id,
+            int(poll_interval or 15),
+            float(delay or 0.2),
+            dedupe_state,
+            anti_flood,
+        ))
+        self.log(f"Sync contínua iniciada: {source_title} → {dest_title}", "success")
+        self.emit_progress({
+            "type": "sync",
+            "status": "active",
+            "processed": 0,
+            "media_files": 0,
+            "ram_bypass_used": 0,
+            "skipped_duplicates": 0,
+            "errors": 0,
+            "poll_interval": int(poll_interval or 15),
+            "source_title": source_title,
+            "dest_title": dest_title,
+            "last_seen_id": last_seen_id,
+        })
+        return {"ok": True, "sync_state": self.sync_state}
+
+    async def rpc_stop_live_sync(self):
+        if not self.sync_task:
+            self.sync_state["active"] = False
+            return {"ok": True, "sync_state": self.sync_state}
+
+        self.sync_state["active"] = False
+        self.sync_task.cancel()
+        try:
+            await self.sync_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.sync_task = None
+
+        source = self.sync_state.get("source", "")
+        dest = self.sync_state.get("dest", "")
+        source_title = self.sync_state.get("source_title", source)
+        dest_title = self.sync_state.get("dest_title", dest)
+        self._append_history_entry(self._create_history_entry(
+            "sync",
+            "stopped",
+            source,
+            dest,
+            source_title,
+            dest_title,
+            self.sync_state.get("started_at"),
+            cloned=self.sync_state.get("processed", 0),
+            total=self.sync_state.get("processed", 0),
+            media_files=self.sync_state.get("media_files", 0),
+            ram_bypass_used=self.sync_state.get("ram_bypass_used", 0),
+            errors=self.sync_state.get("errors", 0),
+            skipped_duplicates=self.sync_state.get("skipped_duplicates", 0),
+        ))
+        self.emit_progress({
+            "type": "sync",
+            "status": "stopped",
+            "processed": self.sync_state.get("processed", 0),
+            "media_files": self.sync_state.get("media_files", 0),
+            "ram_bypass_used": self.sync_state.get("ram_bypass_used", 0),
+            "skipped_duplicates": self.sync_state.get("skipped_duplicates", 0),
+            "errors": self.sync_state.get("errors", 0),
+            "source_title": source_title,
+            "dest_title": dest_title,
+        })
+        self.log("Sync contínua interrompida.", "warning")
+        return {"ok": True, "sync_state": self.sync_state}
 
     # ── Multi-Group Clone ──
 
     async def create_forum_topic(self, channel, title):
         try:
+            input_channel = await self._get_forum_input_channel(channel, "grupo de destino")
             result = await self.client(CreateForumTopicRequest(
-                channel=channel,
+                channel=input_channel,
                 title=title,
                 random_id=random.randint(1, 2**63 - 1),
             ))
@@ -793,8 +2061,17 @@ class HaumeaServer:
             self.log(f"Erro ao criar tópico '{title}': {e}", "error")
             raise
 
-    async def clone_to_topic(self, source_entity, dest_entity, topic_id, limit, delay,
-                             pause_every, pause_duration, source_title, source_topic_id=None):
+    async def clone_to_topic(
+        self,
+        source_entity,
+        dest_entity,
+        topic_id,
+        limit,
+        delay,
+        anti_flood,
+        source_title,
+        source_topic_id=None,
+    ):
         messages = []
         async for msg in self.client.iter_messages(
             source_entity,
@@ -804,32 +2081,61 @@ class HaumeaServer:
 
         total = len(messages)
         cloned = 0
+        ram_bypass_used = 0
+        anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
         self.log(f"Clonando {total} msgs de '{source_title}' para tópico...", "info")
 
         for i, msg in enumerate(messages):
             if self.stop_flag:
                 break
             try:
-                if not await self._send_message_like_main(dest_entity, msg, reply_to=topic_id):
+                sent, _ = await self._deliver_message_with_refresh(
+                    source_entity,
+                    dest_entity,
+                    msg,
+                    reply_to=topic_id,
+                )
+                if not sent:
                     cloned += 1
                     continue
 
                 cloned += 1
-                if pause_every > 0 and cloned % pause_every == 0:
-                    self.log(f"Anti-flood: pausando {pause_duration}s...", "warning")
-                    await asyncio.sleep(pause_duration)
+                if self._last_send_used_ram_bypass:
+                    ram_bypass_used += 1
+                if anti_flood_cycle and cloned >= anti_flood_cycle["after_messages"]:
+                    pause_seconds = anti_flood_cycle["duration"]
+                    self.log(
+                        f"Proteção local: pausando {self._format_seconds(pause_seconds)}s "
+                        f"após {anti_flood_cycle['frequency']} envios neste ciclo.",
+                        "warning",
+                    )
+                    await asyncio.sleep(pause_seconds)
+                    anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
                 await asyncio.sleep(delay)
             except FloodWaitError as e:
                 self.log(f"FloodWait: aguardando {e.seconds + 5}s...", "error")
                 await asyncio.sleep(e.seconds + 5)
+                anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
             except Exception as e:
                 self.log(f"Erro msg #{msg.id}: {e}", "error")
 
         self.log(f"'{source_title}' concluído: {cloned}/{total}", "success")
-        return cloned
+        self.log(f"Bypass RAM em '{source_title}': {ram_bypass_used}", "info")
+        return {"cloned": cloned, "ram_bypass_used": ram_bypass_used}
 
-    async def rpc_multi_clone(self, sources=None, dest="", limit=0, delay=0.1,
-                              pause_every=50, pause_duration=2):
+    async def rpc_multi_clone(
+        self,
+        sources=None,
+        dest="",
+        limit=0,
+        delay=0.1,
+        pause_every=50,
+        pause_duration=2,
+        pause_every_min=None,
+        pause_every_max=None,
+        pause_duration_min=None,
+        pause_duration_max=None,
+    ):
         if not self.logged_in:
             raise Exception("Não conectado")
         if not sources:
@@ -837,8 +2143,21 @@ class HaumeaServer:
 
         self.stop_flag = False
         self._dialogs_cached = False
-        dest_entity, _dest_topic_id = await self.resolve_target(dest)
+        anti_flood = self._resolve_anti_flood_config(
+            pause_every=pause_every,
+            pause_duration=pause_duration,
+            pause_every_min=pause_every_min,
+            pause_every_max=pause_every_max,
+            pause_duration_min=pause_duration_min,
+            pause_duration_max=pause_duration_max,
+        )
+        dest_entity, dest_topic_id = await self.resolve_target(dest)
+        if dest_topic_id:
+            raise Exception("Informe apenas o grupo fórum de destino no multi-clone, não um tópico específico.")
+        await self._get_forum_input_channel(dest_entity, "grupo de destino")
         total_groups = len(sources)
+        total_ram_bypass_used = 0
+        self.log("Iniciando multi-clone com bypass RAM automático quando necessário.", "info")
 
         for idx, src in enumerate(sources):
             if self.stop_flag:
@@ -848,31 +2167,50 @@ class HaumeaServer:
                 continue
 
             self.log(f"Grupo {idx+1}/{total_groups}: {src}", "info")
-            self.emit_progress({"type": "multi", "group_index": idx, "total_groups": total_groups})
+            self.emit_progress({
+                "type": "multi",
+                "group_index": idx,
+                "total_groups": total_groups,
+                "ram_bypass_used": total_ram_bypass_used,
+            })
 
             try:
                 source_entity, source_topic_id = await self.resolve_target(src)
-                source_title = getattr(source_entity, 'title', str(src))
+                source_forum_title = getattr(source_entity, 'title', str(src))
+                source_title = source_forum_title
                 if source_topic_id:
                     source_title = f"{source_title} > tópico {source_topic_id}"
-                topic_id = await self.create_forum_topic(dest_entity, source_title)
-                self.log(f"Tópico criado: '{source_title}' (ID: {topic_id})", "success")
-                await self.clone_to_topic(source_entity, dest_entity, topic_id,
-                                          limit, delay, pause_every, pause_duration, source_title, source_topic_id)
+                topic_id = await self.create_forum_topic(dest_entity, source_forum_title)
+                self.log(f"Tópico criado: '{source_forum_title}' (ID: {topic_id})", "success")
+                result = await self.clone_to_topic(
+                    source_entity,
+                    dest_entity,
+                    topic_id,
+                    limit,
+                    delay,
+                    anti_flood,
+                    source_title,
+                    source_topic_id,
+                )
+                total_ram_bypass_used += int((result or {}).get("ram_bypass_used", 0) or 0)
             except Exception as e:
                 self.log(f"Erro no grupo '{src}': {e}", "error")
 
         self.log("Multi-clone concluído!", "success")
-        self.emit_progress({"type": "multi", "status": "done"})
-        return {"ok": True}
-
-    # ── Forum Clone ──
+        self.log(f"Bypass RAM total no multi-clone: {total_ram_bypass_used}", "info")
+        self.emit_progress({
+            "type": "multi",
+            "status": "done",
+            "ram_bypass_used": total_ram_bypass_used,
+        })
+        return {"ok": True, "ram_bypass_used": total_ram_bypass_used}
 
     async def get_forum_topics(self, entity):
         topics = []
         try:
+            input_channel = await self._get_forum_input_channel(entity, "grupo de origem")
             result = await self.client(GetForumTopicsRequest(
-                channel=entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                channel=input_channel, offset_date=0, offset_id=0, offset_topic=0, limit=100
             ))
             if hasattr(result, 'topics'):
                 for t in result.topics:
@@ -883,8 +2221,17 @@ class HaumeaServer:
             self.log(f"Erro ao obter tópicos: {e}", "error")
         return topics
 
-    async def clone_topic_messages(self, source_entity, source_topic_id, dest_entity,
-                                    dest_topic_id, limit, delay, pause_every, pause_duration, topic_title):
+    async def clone_topic_messages(
+        self,
+        source_entity,
+        source_topic_id,
+        dest_entity,
+        dest_topic_id,
+        limit,
+        delay,
+        anti_flood,
+        topic_title,
+    ):
         messages = []
         async for msg in self.client.iter_messages(
             source_entity, limit=None if limit == 0 else limit,
@@ -894,43 +2241,90 @@ class HaumeaServer:
 
         total = len(messages)
         cloned = 0
+        ram_bypass_used = 0
+        errors = 0
+        anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
         self.log(f"Clonando {total} msgs do tópico '{topic_title}'...", "info")
 
         for i, msg in enumerate(messages):
             if self.stop_flag:
                 break
             try:
-                if not await self._send_message_like_main(dest_entity, msg, reply_to=dest_topic_id):
+                sent, _ = await self._deliver_message_with_refresh(
+                    source_entity,
+                    dest_entity,
+                    msg,
+                    reply_to=dest_topic_id,
+                )
+                if not sent:
                     cloned += 1
                     continue
 
                 cloned += 1
-                if pause_every > 0 and cloned % pause_every == 0:
-                    await asyncio.sleep(pause_duration)
+                if self._last_send_used_ram_bypass:
+                    ram_bypass_used += 1
+                if anti_flood_cycle and cloned >= anti_flood_cycle["after_messages"]:
+                    pause_seconds = anti_flood_cycle["duration"]
+                    self.log(
+                        f"Proteção local: pausando {self._format_seconds(pause_seconds)}s "
+                        f"após {anti_flood_cycle['frequency']} envios neste ciclo.",
+                        "warning",
+                    )
+                    await asyncio.sleep(pause_seconds)
+                    anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
                 await asyncio.sleep(delay)
             except FloodWaitError as e:
+                errors += 1
                 await asyncio.sleep(e.seconds + 5)
+                anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
             except Exception as e:
+                errors += 1
                 self.log(f"Erro msg #{msg.id}: {e}", "error")
 
-        return cloned
+        return {"cloned": cloned, "ram_bypass_used": ram_bypass_used, "errors": errors}
 
-    async def rpc_forum_clone(self, source="", dest="", limit=0, delay=0.1,
-                              pause_every=50, pause_duration=2):
+    async def rpc_forum_clone(
+        self,
+        source="",
+        dest="",
+        limit=0,
+        delay=0.1,
+        pause_every=50,
+        pause_duration=2,
+        pause_every_min=None,
+        pause_every_max=None,
+        pause_duration_min=None,
+        pause_duration_max=None,
+    ):
         if not self.logged_in:
             raise Exception("Não conectado")
 
         self.stop_flag = False
         self._dialogs_cached = False
+        anti_flood = self._resolve_anti_flood_config(
+            pause_every=pause_every,
+            pause_duration=pause_duration,
+            pause_every_min=pause_every_min,
+            pause_every_max=pause_every_max,
+            pause_duration_min=pause_duration_min,
+            pause_duration_max=pause_duration_max,
+        )
 
         source_entity, source_topic_id = await self.resolve_target(source)
-        dest_entity, _dest_topic_id = await self.resolve_target(dest)
+        dest_entity, dest_topic_id = await self.resolve_target(dest)
+        if dest_topic_id:
+            raise Exception("Informe apenas o grupo fórum de destino na clonagem de fórum, não um tópico específico.")
+        await self._get_forum_input_channel(dest_entity, "grupo de destino")
+        if not source_topic_id:
+            await self._get_forum_input_channel(source_entity, "grupo de origem")
 
         if source_topic_id:
             source_topics = [{"id": source_topic_id, "title": f"Tópico {source_topic_id}"}]
         else:
             source_topics = await self.get_forum_topics(source_entity)
         total_topics = len(source_topics)
+        total_ram_bypass_used = 0
+        total_errors = 0
         self.log(f"Encontrados {total_topics} tópicos no fórum de origem", "info")
 
         for idx, topic in enumerate(source_topics):
@@ -940,210 +2334,40 @@ class HaumeaServer:
             self.log(f"Tópico {idx+1}/{total_topics}: {topic['title']}", "info")
             self.emit_progress({
                 "type": "forum", "topic_index": idx, "total_topics": total_topics,
-                "topic_title": topic['title']
+                "topic_title": topic['title'],
+                "ram_bypass_used": total_ram_bypass_used,
+                "errors": total_errors,
             })
 
             try:
                 new_topic_id = await self.create_forum_topic(dest_entity, topic['title'])
                 self.log(f"Tópico criado: '{topic['title']}' (ID: {new_topic_id})", "success")
-                await self.clone_topic_messages(
+                topic_result = await self.clone_topic_messages(
                     source_entity, topic['id'], dest_entity, new_topic_id,
-                    limit, delay, pause_every, pause_duration, topic['title']
+                    limit, delay, anti_flood, topic['title']
                 )
+                total_ram_bypass_used += int((topic_result or {}).get("ram_bypass_used", 0) or 0)
+                total_errors += int((topic_result or {}).get("errors", 0) or 0)
             except Exception as e:
+                total_errors += 1
                 self.log(f"Erro no tópico '{topic['title']}': {e}", "error")
 
         self.log("Clonagem de fórum concluída!", "success")
-        self.emit_progress({"type": "forum", "status": "done"})
-        return {"ok": True}
-
-    # ── Restricted Clone ──
-
-    async def rpc_restricted_clone(self, source="", dest="", limit=0, delay=0.1,
-                                    pause_every=50, pause_duration=2, topic_id=None):
-        if not self.logged_in:
-            raise Exception("Não conectado")
-
-        self.stop_flag = False
-        self.skip_current_file = False
-        self._dialogs_cached = False
-
-        source_entity, source_topic_id = await self.resolve_target(source)
-        dest_entity, dest_topic_id = await self.resolve_target(dest)
-        source_title = getattr(source_entity, 'title', str(source))
-        dest_title = getattr(dest_entity, 'title', str(dest))
-        if source_topic_id:
-            source_title = f"{source_title} > tópico {source_topic_id}"
-        if dest_topic_id:
-            dest_title = f"{dest_title} > tópico {dest_topic_id}"
-        self.log(f"Origem restrita: {source_title}", "info")
-        self.log(f"Destino: {dest_title}", "info")
-
-        # Count messages
-        total = 0
-        async for _ in self.client.iter_messages(
-            source_entity,
-            **self.get_iter_messages_kwargs(limit=limit, reply_to=source_topic_id)
-        ):
-            total += 1
-        self.log(f"Total: {total} mensagens", "info")
-
-        messages = []
-        async for msg in self.client.iter_messages(
-            source_entity,
-            **self.get_iter_messages_kwargs(limit=limit, reverse=True, reply_to=source_topic_id)
-        ):
-            messages.append(msg)
-
-        cloned = 0
-        downloaded = 0
-        errors = 0
-        self._download_start_time = time.time()
-
-        for i, msg in enumerate(messages):
-            if self.stop_flag:
-                self.log("Clonagem restrita interrompida!", "warning")
-                break
-
-            try:
-                media_type = self.get_media_type(msg)
-                reply_to = topic_id if topic_id else dest_topic_id
-
-                if msg.media and not isinstance(msg.media, (MessageMediaWebPage, MessageMediaPoll,
-                                                             MessageMediaDice, MessageMediaContact,
-                                                             MessageMediaGeo, MessageMediaGeoLive,
-                                                             MessageMediaVenue)):
-                    # Download to temp file
-                    self.skip_current_file = False
-                    file_ext = ".bin"
-                    original_filename = None
-                    if isinstance(msg.media, MessageMediaPhoto):
-                        file_ext = ".jpg"
-                    elif isinstance(msg.media, MessageMediaDocument) and msg.media.document:
-                        for attr in msg.media.document.attributes:
-                            if isinstance(attr, DocumentAttributeFilename):
-                                original_filename = attr.file_name
-                                file_ext = os.path.splitext(attr.file_name)[1] or file_ext
-                                break
-
-                    total_size = 0
-                    if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
-                        total_size = msg.media.document.size or 0
-
-                    filename = f"msg_{msg.id}{file_ext}"
-                    self.emit_progress({
-                        "type": "restricted", "status": "downloading",
-                        "cloned": cloned, "total": total, "filename": filename,
-                        "file_size": total_size,
-                    })
-
-                    def make_progress_cb(fn, ts):
-                        def cb(current, total_bytes):
-                            if self.skip_current_file:
-                                raise Exception("SKIP_FILE")
-                            elapsed = time.time() - self._download_start_time
-                            speed = current / elapsed if elapsed > 0 else 0
-                            eta = (ts - current) / speed if speed > 0 else 0
-                            self.emit_progress({
-                                "type": "download",
-                                "current": current, "total": total_bytes or ts,
-                                "speed": self._format_speed(speed),
-                                "eta": self._format_eta(eta),
-                                "filename": fn,
-                                "percent": int((current / (total_bytes or ts)) * 100) if (total_bytes or ts) > 0 else 0,
-                            })
-                        return cb
-
-                    with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as tmp:
-                        tmp_path = tmp.name
-
-                    try:
-                        self._download_start_time = time.time()
-                        await msg.download_media(
-                            file=tmp_path,
-                            progress_callback=make_progress_cb(filename, total_size)
-                        )
-                        downloaded += 1
-
-                        # Upload to destination
-                        def make_upload_cb(fn, ts):
-                            def cb(current, total_bytes):
-                                self.emit_progress({
-                                    "type": "upload",
-                                    "current": current, "total": total_bytes or ts,
-                                    "filename": fn,
-                                    "percent": int((current / (total_bytes or ts)) * 100) if (total_bytes or ts) > 0 else 0,
-                                })
-                            return cb
-
-                        await self._send_downloaded_media_like_main(
-                            dest_entity,
-                            tmp_path,
-                            msg,
-                            reply_to=reply_to,
-                            progress_callback=make_upload_cb(filename, total_size),
-                            original_filename=original_filename,
-                        )
-                    except Exception as exc:
-                        if "SKIP_FILE" in str(exc):
-                            self.log(f"Arquivo pulado: {filename}", "warning")
-                        else:
-                            raise
-                    finally:
-                        try:
-                            os.unlink(tmp_path)
-                        except Exception:
-                            pass
-
-                elif isinstance(msg.media, MessageMediaPoll):
-                    kwargs = {'reply_to': topic_id} if topic_id else {}
-                    await self.client.send_message(dest_entity, file=msg.media, **kwargs)
-                elif isinstance(msg.media, MessageMediaDice):
-                    kwargs = {'reply_to': topic_id} if topic_id else {}
-                    await self.client.send_message(dest_entity, file=msg.media, **kwargs)
-                elif msg.media or msg.message:
-                    if not await self._send_message_like_main(dest_entity, msg, reply_to=reply_to):
-                        cloned += 1
-                        continue
-                else:
-                    cloned += 1
-                    continue
-
-                cloned += 1
-                pct = int((cloned / total) * 100) if total else 0
-                self.emit_progress({
-                    "type": "restricted", "status": "running",
-                    "cloned": cloned, "total": total, "percent": pct,
-                    "downloaded": downloaded, "errors": errors,
-                })
-
-                if pause_every > 0 and cloned % pause_every == 0:
-                    self.log(f"Anti-flood: pausando {pause_duration}s...", "warning")
-                    await asyncio.sleep(pause_duration)
-
-                await asyncio.sleep(delay)
-
-            except FloodWaitError as e:
-                wait = e.seconds + 5
-                self.log(f"FloodWait: aguardando {wait}s...", "error")
-                await asyncio.sleep(wait)
-            except Exception as e:
-                if "SKIP_FILE" not in str(e):
-                    errors += 1
-                    self.log(f"Erro msg #{msg.id}: {e}", "error")
-
-        self.log(f"Clonagem restrita concluída! {cloned}/{total}, baixados: {downloaded}, erros: {errors}", "success")
+        self.log(f"Bypass RAM total no clone de fórum: {total_ram_bypass_used}", "info")
         self.emit_progress({
-            "type": "restricted", "status": "done",
-            "cloned": cloned, "total": total, "downloaded": downloaded, "errors": errors,
+            "type": "forum",
+            "status": "done",
+            "ram_bypass_used": total_ram_bypass_used,
+            "errors": total_errors,
+            "total_topics": total_topics,
         })
-        return {"ok": True, "cloned": cloned, "total": total, "downloaded": downloaded, "errors": errors}
-
+        return {"ok": True, "ram_bypass_used": total_ram_bypass_used, "errors": total_errors}
 
 # ── Main Loop ──
 
 async def main():
     server = HaumeaServer()
+    server.loop = asyncio.get_running_loop()
 
     if sys.stdin.isatty():
         print(
@@ -1162,6 +2386,9 @@ async def main():
             if not line:
                 continue
             req = json.loads(line)
+            if req.get("method") == "shutdown":
+                await server.handle(req)
+                break
             # Handle in background to not block stdin reading
             asyncio.create_task(server.handle(req))
         except json.JSONDecodeError:

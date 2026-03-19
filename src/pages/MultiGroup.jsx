@@ -49,9 +49,9 @@ export default function MultiGroup({ telegram }) {
 
     return (
         <div className="data-grid">
-            <Card eyebrow="LOTES" title="Clone Multi-Grupo" description="Consolide múltiplos grupos em um fórum de destino.">
+            <Card eyebrow="LOTES" title="Clone Tópicos" description="Consolide múltiplos grupos em um fórum de destino com bypass RAM automático para conteúdo protegido.">
                 <div className="form-grid">
-                    <Field label="Grupos de Origem" hint="UM POR LINHA">
+                    <Field label="Grupos de origem" hint="UM POR LINHA">
                         <textarea
                             value={sources}
                             onChange={(e) => setSources(e.target.value)}
@@ -63,13 +63,18 @@ export default function MultiGroup({ telegram }) {
                         />
                     </Field>
 
-                    <Field label="Grupo de Destino" hint="FÓRUM ATIVADO">
+                    <Field label="Grupo de destino" hint="FÓRUM ATIVADO">
                         <input value={dest} onChange={(e) => setDest(e.target.value)} placeholder="@destino" className="field-input" disabled={running} />
                     </Field>
 
+                    <div className="status-banner ready" style={{ marginBottom: 0 }}>
+                        <strong>Detecção automática de proteção</strong>
+                        <p>O clone tenta o envio padrão e ativa o bypass RAM sozinho quando uma mensagem protegida exigir esse caminho.</p>
+                    </div>
+
                     <div className="form-actions">
                         <button onClick={handleStart} disabled={!connected || running || !sourceCount || !dest} className="btn btn-primary" type="button">
-                            {running ? 'PROCESSANDO...' : 'INICIAR MULTI-CLONE'}
+                            {running ? 'PROCESSANDO...' : 'INICIAR CLONE TÓPICOS'}
                         </button>
 
                         {running && (
@@ -88,18 +93,26 @@ export default function MultiGroup({ telegram }) {
                         <div className="kpi-row">
                             <div>
                                 <span className="kpi-val">{multiProgress ? (multiProgress.group_index || 0) + 1 : '-'}</span>
-                                <span className="kpi-lbl">Lote Atual</span>
+                                <span className="kpi-lbl">Lote atual</span>
                             </div>
                             <div>
                                 <span className="kpi-val">{multiProgress?.total_groups ?? (sourceCount || '-')}</span>
-                                <span className="kpi-lbl">Total Lotes</span>
+                                <span className="kpi-lbl">Total de lotes</span>
+                            </div>
+                            <div>
+                                <span className="kpi-val">{multiProgress?.ram_bypass_used ?? 0}</span>
+                                <span className="kpi-lbl">Bypass RAM</span>
                             </div>
                         </div>
                     </>
                 ) : (
                     <div className={`status-banner ${connected ? 'ready' : ''}`}>
-                        <strong>{connected ? 'Sistema Preparado' : 'Aguardando Conexão'}</strong>
-                        <p>{connected ? `Fontes informadas: ${sourceCount}` : 'Requer sessão ativa no Telegram.'}</p>
+                        <strong>{connected ? 'Sistema preparado' : 'Aguardando conexão'}</strong>
+                        <p>
+                            {connected
+                                ? `Fontes informadas: ${sourceCount}`
+                                : 'Requer sessão ativa no Telegram.'}
+                        </p>
                     </div>
                 )}
             </Card>

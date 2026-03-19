@@ -10,6 +10,17 @@ const TITLEBAR_HEIGHT = 40
 let mainWindow
 let pythonBridge
 
+function getStoredCredentials() {
+    return store.get('credentials') || {}
+}
+
+function patchStoredCredentials(patch = {}) {
+    const current = getStoredCredentials()
+    const next = { ...current, ...patch }
+    store.set('credentials', next)
+    return next
+}
+
 function createWindow() {
     const isMac = process.platform === 'darwin'
 
@@ -49,7 +60,7 @@ function createWindow() {
     })
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
     pythonBridge = new PythonBridge()
 
     pythonBridge.onLog((data) => {
@@ -79,14 +90,21 @@ app.whenReady().then(() => {
     ipcMain.handle('store:set', (_event, key, value) => store.set(key, value))
     ipcMain.handle('store:delete', (_event, key) => store.delete(key))
     ipcMain.handle('store:getAll', () => store.store)
+    ipcMain.handle('store:patchCredentials', (_event, patch) => patchStoredCredentials(patch))
+    ipcMain.handle('store:clearSession', () => patchStoredCredentials({ session_string: '' }))
 
-    pythonBridge.start()
+    const started = await pythonBridge.start()
+    if (!started?.ok) {
+        console.error('[python:start]', started?.error || 'backend unavailable during boot')
+    }
     createWindow()
 })
 
 app.on('window-all-closed', () => {
-    pythonBridge?.stop()
-    app.quit()
+    void (async () => {
+        await pythonBridge?.stop()
+        app.quit()
+    })()
 })
 
 app.on('activate', () => {
