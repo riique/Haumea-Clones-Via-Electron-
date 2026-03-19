@@ -142,11 +142,25 @@ Para gerar o pacote Windows completo com backend embutido:
 npm run build
 ```
 
+Para publicar uma nova versão com auto-update no GitHub Releases:
+
+```bash
+npm run build:publish
+```
+
 Saídas esperadas:
 
 - `dist-python/haumea-backend.exe`
 - `release/Haumea Clones Setup 2.0.0.exe`
 - `release/win-unpacked/Haumea Clones.exe`
+
+## Auto-update via GitHub
+
+O projeto está configurado para usar `electron-updater` com GitHub Releases.
+
+- no app instalado, a nova versão pode ser detectada, baixada e aplicada pelo próprio aplicativo
+- o backend Python vai junto no update porque é empacotado como recurso do app
+- o workflow `.github/workflows/release.yml` publica novas versões ao enviar uma tag `v*`
 
 ## Segurança
 

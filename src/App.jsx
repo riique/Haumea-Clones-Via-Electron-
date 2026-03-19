@@ -7,6 +7,7 @@ import ChannelClone from './pages/ChannelClone'
 import MultiGroup from './pages/MultiGroup'
 import ForumClone from './pages/ForumClone'
 import OpsCenter from './pages/OpsCenter'
+import { useAppUpdate } from './hooks/useAppUpdate'
 import { useTelegram } from './hooks/useTelegram'
 
 const TABS = [
@@ -20,6 +21,7 @@ const TABS = [
 export default function App() {
     const [activeTab, setActiveTab] = useState('config')
     const telegram = useTelegram()
+    const update = useAppUpdate()
 
     const renderPage = () => {
         switch (activeTab) {
@@ -43,6 +45,7 @@ export default function App() {
                     status={telegram.status}
                     tabs={TABS}
                     user={telegram.user}
+                    update={update}
                 />
             </aside>
 

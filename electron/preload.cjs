@@ -23,6 +23,19 @@ contextBridge.exposeInMainWorld('electron', {
         },
     },
 
+    updater: {
+        getState: () => ipcRenderer.invoke('updater:getState'),
+        check: () => ipcRenderer.invoke('updater:check'),
+        download: () => ipcRenderer.invoke('updater:download'),
+        install: () => ipcRenderer.invoke('updater:install'),
+
+        onState: (callback) => {
+            const handler = (_event, data) => callback(data)
+            ipcRenderer.on('updater:state', handler)
+            return () => ipcRenderer.removeListener('updater:state', handler)
+        },
+    },
+
     store: {
         get: (key) => ipcRenderer.invoke('store:get', key),
         set: (key, value) => ipcRenderer.invoke('store:set', key, value),

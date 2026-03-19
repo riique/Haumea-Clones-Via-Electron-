@@ -8,17 +8,19 @@
     "build:renderer": "vite build",
     "build:python": "pyinstaller --onefile --name haumea-backend --paths . --hidden-import haumea_rpc --distpath ./dist-python backend/server.py",
     "build": "npm run build:python && npm run build:renderer && electron-builder",
+    "build:publish": "npm run build:python && npm run build:renderer && electron-builder --publish always",
     "preview": "vite preview"
   },
   "author": "riiquestudies",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/riique/Haumea-Clones.git"
+    "url": "git+https://github.com/riique/Haumea-Clones-Via-Electron-.git"
   },
   "build": {
     "appId": "com.riique.haumea-clones",
     "productName": "Haumea Clones",
+    "electronUpdaterCompatibility": ">=2.16",
     "directories": {
       "output": "release"
     },
@@ -46,10 +48,19 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "installerIcon": "icon.ico"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "riique",
+        "repo": "Haumea-Clones-Via-Electron-",
+        "releaseType": "release"
+      }
+    ]
   },
   "dependencies": {
-    "electron-store": "^10.0.1"
+    "electron-store": "^10.0.1",
+    "electron-updater": "^6.8.3"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.3",
