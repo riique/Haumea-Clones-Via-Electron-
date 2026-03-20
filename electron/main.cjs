@@ -26,6 +26,8 @@ function createDefaultUpdateState() {
         error: '',
         checkedAt: null,
         releaseNotes: '',
+        startupCheckPending: false,
+        mandatoryUpdate: false,
     }
 }
 
@@ -119,6 +121,93 @@ async function downloadAppUpdate() {
             status: 'error',
             error: message,
             message: 'O download da atualização falhou.',
+        })
+        return { ok: false, error: message }
+    }
+}
+
+async function checkForAppUpdates(options = {}) {
+    const { startup = false } = options
+
+    if (!isAutoUpdateSupported()) {
+        setUpdateState({
+            supported: false,
+            status: 'unsupported',
+            message: 'As atualizacoes automaticas funcionam apenas no app instalado.',
+            error: '',
+            startupCheckPending: false,
+            mandatoryUpdate: false,
+        })
+        return { ok: false, supported: false }
+    }
+
+    if (startup) {
+        setUpdateState({
+            supported: true,
+            status: 'checking',
+            checkedAt: new Date().toISOString(),
+            message: 'Verificando atualizacao obrigatoria...',
+            error: '',
+            percent: 0,
+            transferred: 0,
+            total: 0,
+            startupCheckPending: true,
+            mandatoryUpdate: false,
+        })
+    }
+
+    try {
+        await autoUpdater.checkForUpdates()
+        return { ok: true }
+    } catch (error) {
+        const message = String(error?.message || error || 'Falha ao verificar atualizacoes.')
+        setUpdateState({
+            supported: true,
+            status: 'error',
+            error: message,
+            message: startup || updateState.startupCheckPending
+                ? 'Nao foi possivel validar a atualizacao obrigatoria.'
+                : 'Nao foi possivel verificar atualizacoes agora.',
+            startupCheckPending: startup || updateState.startupCheckPending,
+            mandatoryUpdate: updateState.mandatoryUpdate,
+        })
+        return { ok: false, error: message }
+    }
+}
+
+async function downloadAppUpdate(options = {}) {
+    const { force = false } = options
+
+    if (!isAutoUpdateSupported()) {
+        return { ok: false, error: 'Auto-update indisponivel neste ambiente.' }
+    }
+
+    if (updateState.status === 'downloaded') {
+        return { ok: true, already_downloaded: true }
+    }
+
+    if (updateState.status === 'downloading') {
+        return { ok: true, already_downloading: true }
+    }
+
+    if (!force && updateState.status !== 'available') {
+        return { ok: false, error: 'Nenhuma atualizacao disponivel para download.' }
+    }
+
+    try {
+        await autoUpdater.downloadUpdate()
+        return { ok: true }
+    } catch (error) {
+        const message = String(error?.message || error || 'Falha ao baixar atualizacao.')
+        setUpdateState({
+            supported: true,
+            status: 'error',
+            error: message,
+            message: updateState.mandatoryUpdate || force
+                ? 'O download obrigatorio da atualizacao falhou.'
+                : 'O download da atualizacao falhou.',
+            startupCheckPending: false,
+            mandatoryUpdate: updateState.mandatoryUpdate || force,
         })
         return { ok: false, error: message }
     }
@@ -243,6 +332,131 @@ function setupAutoUpdater() {
     })
 }
 
+function setupAutoUpdater() {
+    updateState = createDefaultUpdateState()
+
+    if (!isAutoUpdateSupported()) {
+        setUpdateState({
+            supported: false,
+            status: 'unsupported',
+            message: 'As atualizacoes automaticas ficam disponiveis no app instalado.',
+            error: '',
+            startupCheckPending: false,
+            mandatoryUpdate: false,
+        })
+        return
+    }
+
+    autoUpdater.autoDownload = false
+    autoUpdater.autoInstallOnAppQuit = false
+    autoUpdater.allowDowngrade = false
+
+    setUpdateState({
+        supported: true,
+        status: 'idle',
+        message: 'A checagem de versao acontece automaticamente ao abrir o app.',
+        error: '',
+        startupCheckPending: false,
+        mandatoryUpdate: false,
+    })
+
+    autoUpdater.on('checking-for-update', () => {
+        setUpdateState({
+            supported: true,
+            status: 'checking',
+            checkedAt: new Date().toISOString(),
+            message: updateState.startupCheckPending
+                ? 'Verificando atualizacao obrigatoria...'
+                : 'Verificando atualizacoes...',
+            error: '',
+            percent: 0,
+            transferred: 0,
+            total: 0,
+        })
+    })
+
+    autoUpdater.on('update-available', (info) => {
+        setUpdateState({
+            supported: true,
+            status: 'available',
+            availableVersion: info?.version || '',
+            downloadedVersion: '',
+            message: 'Nova versao encontrada. O download obrigatorio sera iniciado.',
+            error: '',
+            percent: 0,
+            transferred: 0,
+            total: 0,
+            releaseNotes: normalizeReleaseNotes(info?.releaseNotes),
+            startupCheckPending: false,
+            mandatoryUpdate: true,
+        })
+
+        setImmediate(() => {
+            void downloadAppUpdate({ force: true })
+        })
+    })
+
+    autoUpdater.on('update-not-available', (info) => {
+        setUpdateState({
+            supported: true,
+            status: 'not-available',
+            availableVersion: info?.version || '',
+            downloadedVersion: '',
+            message: 'Voce ja esta na versao mais recente.',
+            error: '',
+            percent: 0,
+            transferred: 0,
+            total: 0,
+            releaseNotes: '',
+            startupCheckPending: false,
+            mandatoryUpdate: false,
+        })
+    })
+
+    autoUpdater.on('download-progress', (progress) => {
+        setUpdateState({
+            supported: true,
+            status: 'downloading',
+            percent: Number((progress?.percent || 0).toFixed(1)),
+            transferred: progress?.transferred || 0,
+            total: progress?.total || 0,
+            message: 'Baixando atualizacao obrigatoria...',
+            error: '',
+            startupCheckPending: false,
+            mandatoryUpdate: true,
+        })
+    })
+
+    autoUpdater.on('update-downloaded', (info) => {
+        setUpdateState({
+            supported: true,
+            status: 'downloaded',
+            availableVersion: info?.version || updateState.availableVersion,
+            downloadedVersion: info?.version || updateState.availableVersion,
+            percent: 100,
+            message: 'Atualizacao obrigatoria pronta para instalar.',
+            error: '',
+            releaseNotes: normalizeReleaseNotes(info?.releaseNotes) || updateState.releaseNotes,
+            startupCheckPending: false,
+            mandatoryUpdate: true,
+        })
+    })
+
+    autoUpdater.on('error', (error) => {
+        const message = String(error?.message || error || 'Falha ao verificar atualizacoes.')
+        setUpdateState({
+            supported: true,
+            status: 'error',
+            message: updateState.startupCheckPending || updateState.mandatoryUpdate
+                ? 'Nao foi possivel concluir a atualizacao obrigatoria.'
+                : 'O sistema de atualizacao encontrou um erro.',
+            error: message,
+            startupCheckPending: updateState.startupCheckPending,
+            mandatoryUpdate: updateState.mandatoryUpdate,
+        })
+    })
+}
+
 function getStoredCredentials() {
     return store.get('credentials') || {}
 }
@@ -343,9 +557,7 @@ app.whenReady().then(async () => {
     createWindow()
 
     if (isAutoUpdateSupported()) {
-        setTimeout(() => {
-            void checkForAppUpdates()
-        }, 3000)
+        void checkForAppUpdates({ startup: true })
     }
 })
 

@@ -296,6 +296,11 @@ textarea {
   border-color: rgba(217, 48, 37, 0.24);
 }
 
+.update-card.required {
+  border-color: rgba(198, 59, 45, 0.24);
+  box-shadow: 0 14px 28px rgba(198, 59, 45, 0.12);
+}
+
 .update-card-header {
   display: flex;
   align-items: flex-start;
@@ -352,6 +357,99 @@ textarea {
   font-size: 12px;
   color: var(--color-ink-muted);
   line-height: 1.5;
+}
+
+.update-required-flag {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: rgba(198, 59, 45, 0.1);
+  color: var(--color-brand);
+  font-family: var(--font-primary-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.update-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at top, rgba(198, 59, 45, 0.14), transparent 36%),
+    rgba(255, 252, 250, 0.94);
+  backdrop-filter: blur(10px);
+}
+
+.update-gate-panel {
+  width: min(100%, 560px);
+  padding: 28px;
+  border: 1px solid rgba(198, 59, 45, 0.18);
+  border-radius: 24px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(250, 247, 244, 0.98) 100%);
+  box-shadow: 0 32px 80px rgba(17, 17, 17, 0.14);
+  display: grid;
+  gap: 14px;
+}
+
+.update-gate-kicker {
+  font-family: var(--font-primary-mono);
+  font-size: 10px;
+  color: var(--color-brand);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.update-gate-title {
+  font-size: clamp(28px, 4vw, 36px);
+  line-height: 1;
+}
+
+.update-gate-copy {
+  color: var(--color-ink-muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.update-gate-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.update-gate-progress {
+  height: 8px;
+}
+
+.update-gate-notes {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(17, 17, 17, 0.03);
+}
+
+.update-gate-notes strong {
+  font-size: 12px;
+}
+
+.update-gate-notes p {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.update-gate-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .sidebar-credit {

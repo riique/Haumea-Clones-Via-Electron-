@@ -15,6 +15,8 @@ const INITIAL_STATE = {
     error: '',
     checkedAt: null,
     releaseNotes: '',
+    startupCheckPending: false,
+    mandatoryUpdate: false,
 }
 
 export function useAppUpdate() {
@@ -60,6 +62,7 @@ export function useAppUpdate() {
 
     return {
         ...state,
+        blockingUpdateFlow: Boolean(state.supported && (state.startupCheckPending || state.mandatoryUpdate)),
         checkForUpdates,
         downloadUpdate,
         installUpdate,

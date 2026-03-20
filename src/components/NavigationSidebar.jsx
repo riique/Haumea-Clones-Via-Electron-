@@ -4,13 +4,14 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
     const indClass = connected ? 'on' : pending ? 'wait' : 'off'
     const updateCopy = getUpdateCopy(update)
     const releaseNotes = getReleaseNotesPreview(update?.releaseNotes)
+    const blockingUpdateFlow = Boolean(update?.blockingUpdateFlow)
 
     return (
         <div className="nav-shell">
             <div className="brand titlebar-nodrag">
                 <span className="nav-eyebrow">Painel</span>
                 <h1 className="brand-name">Haumea Clones</h1>
-                <p className="brand-desc">Ferramentas de clonagem e gestão em um fluxo mais claro.</p>
+                <p className="brand-desc">Ferramentas de clonagem e gestao em um fluxo mais claro.</p>
             </div>
 
             <div className="nav-scroll titlebar-nodrag">
@@ -37,24 +38,28 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
             <footer className="nav-footer titlebar-nodrag">
                 <div className="status-pill">
                     <span className={`indicator ${indClass}`} />
-                    <span>{connected ? 'Sessão ativa' : pending ? 'Conectando...' : 'Desconectado'}</span>
+                    <span>{connected ? 'Sessao ativa' : pending ? 'Conectando...' : 'Desconectado'}</span>
                 </div>
 
                 <div className="user-meta">
-                    <strong>{user?.name ?? 'Sessão ausente'}</strong>
-                    <span>{user?.username ? `@${user.username}` : 'Conecte-se à API'}</span>
+                    <strong>{user?.name ?? 'Sessao ausente'}</strong>
+                    <span>{user?.username ? `@${user.username}` : 'Conecte-se a API'}</span>
                 </div>
 
-                <section className={`update-card ${update?.status || 'idle'}`}>
+                <section className={`update-card ${update?.status || 'idle'} ${blockingUpdateFlow ? 'required' : ''}`}>
                     <div className="update-card-header">
                         <div>
-                            <strong className="update-card-title">Atualizações</strong>
+                            <strong className="update-card-title">Atualizacoes</strong>
                             <p className="update-card-copy">{updateCopy.title}</p>
                         </div>
                         <span className="mono-tag">v{update?.currentVersion || '-'}</span>
                     </div>
 
                     <p className="update-card-copy">{updateCopy.description}</p>
+
+                    {showBlockingFlag(blockingUpdateFlow) && (
+                        <span className="update-required-flag">Fluxo obrigatorio</span>
+                    )}
 
                     {update?.status === 'downloading' && (
                         <div className="update-progress">
@@ -66,19 +71,21 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
                         <span className="update-meta">{Number(update?.percent || 0).toFixed(1)}% baixado</span>
                     )}
 
-                    {releaseNotes && ['available', 'downloaded'].includes(update?.status) && (
+                    {releaseNotes && ['available', 'downloaded', 'downloading'].includes(update?.status) && (
                         <p className="update-notes">{releaseNotes}</p>
                     )}
 
                     <div className="update-actions">
-                        <button
-                            className="btn btn-ghost btn-compact"
-                            type="button"
-                            onClick={() => update?.checkForUpdates?.()}
-                            disabled={!update?.supported || ['checking', 'downloading'].includes(update?.status)}
-                        >
-                            {update?.status === 'checking' ? 'VERIFICANDO...' : 'VERIFICAR'}
-                        </button>
+                        {!blockingUpdateFlow && (
+                            <button
+                                className="btn btn-ghost btn-compact"
+                                type="button"
+                                onClick={() => update?.checkForUpdates?.()}
+                                disabled={!update?.supported || ['checking', 'downloading'].includes(update?.status)}
+                            >
+                                {update?.status === 'checking' ? 'VERIFICANDO...' : 'VERIFICAR'}
+                            </button>
+                        )}
 
                         {update?.status === 'available' && (
                             <button
@@ -86,7 +93,7 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
                                 type="button"
                                 onClick={() => update?.downloadUpdate?.()}
                             >
-                                BAIXAR
+                                {blockingUpdateFlow ? 'BAIXAR AGORA' : 'BAIXAR'}
                             </button>
                         )}
 
@@ -96,7 +103,17 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
                                 type="button"
                                 onClick={() => update?.installUpdate?.()}
                             >
-                                REINICIAR
+                                {blockingUpdateFlow ? 'INSTALAR' : 'REINICIAR'}
+                            </button>
+                        )}
+
+                        {update?.status === 'error' && blockingUpdateFlow && (
+                            <button
+                                className="btn btn-primary btn-compact"
+                                type="button"
+                                onClick={() => update?.checkForUpdates?.()}
+                            >
+                                TENTAR DE NOVO
                             </button>
                         )}
                     </div>
@@ -114,46 +131,58 @@ export default function NavigationSidebar({ activeTab, onSelect, status, tabs, u
 }
 
 function getUpdateCopy(update) {
+    const blockingUpdateFlow = Boolean(update?.blockingUpdateFlow)
+
     switch (update?.status) {
         case 'unsupported':
             return {
-                title: 'Auto-update indisponível aqui',
-                description: update?.message || 'Use a versão instalada para receber atualizações automáticas.',
+                title: 'Auto-update indisponivel aqui',
+                description: update?.message || 'Use a versao instalada para receber atualizacoes automaticas.',
             }
         case 'checking':
             return {
-                title: 'Procurando nova versão',
-                description: 'O app está consultando o GitHub Releases agora.',
+                title: blockingUpdateFlow ? 'Validando versao obrigatoria' : 'Procurando nova versao',
+                description: blockingUpdateFlow
+                    ? 'A abertura do app depende dessa verificacao automatica.'
+                    : 'O app esta consultando o GitHub Releases agora.',
             }
         case 'available':
             return {
-                title: update?.availableVersion ? `Nova versão v${update.availableVersion}` : 'Nova versão disponível',
-                description: 'Você pode baixar a atualização sem reinstalar manualmente.',
+                title: update?.availableVersion ? `Nova versao v${update.availableVersion}` : 'Nova versao disponivel',
+                description: blockingUpdateFlow
+                    ? 'Essa atualizacao e obrigatoria e o download automatico ja foi iniciado.'
+                    : 'Voce pode baixar a atualizacao sem reinstalar manualmente.',
             }
         case 'downloading':
             return {
-                title: update?.availableVersion ? `Baixando v${update.availableVersion}` : 'Baixando atualização',
-                description: 'O download acontece no próprio aplicativo.',
+                title: update?.availableVersion ? `Baixando v${update.availableVersion}` : 'Baixando atualizacao',
+                description: blockingUpdateFlow
+                    ? 'O app fica bloqueado ate o pacote obrigatorio terminar de baixar.'
+                    : 'O download acontece no proprio aplicativo.',
             }
         case 'downloaded':
             return {
-                title: update?.downloadedVersion ? `v${update.downloadedVersion} pronta` : 'Atualização pronta',
-                description: 'Clique em reiniciar para fechar e aplicar a nova versão.',
+                title: update?.downloadedVersion ? `v${update.downloadedVersion} pronta` : 'Atualizacao pronta',
+                description: blockingUpdateFlow
+                    ? 'Instale e reinicie para liberar o restante do app.'
+                    : 'Clique em reiniciar para fechar e aplicar a nova versao.',
             }
         case 'not-available':
             return {
                 title: 'Tudo em dia',
-                description: update?.message || 'Nenhuma atualização encontrada no momento.',
+                description: update?.message || 'Nenhuma atualizacao encontrada no momento.',
             }
         case 'error':
             return {
-                title: 'Falha no updater',
-                description: update?.error || update?.message || 'Tente verificar novamente em instantes.',
+                title: blockingUpdateFlow ? 'Atualizacao obrigatoria pendente' : 'Falha no updater',
+                description: blockingUpdateFlow
+                    ? update?.error || 'Tente novamente para validar a versao mais recente.'
+                    : update?.error || update?.message || 'Tente verificar novamente em instantes.',
             }
         default:
             return {
-                title: update?.currentVersion ? `Versão atual v${update.currentVersion}` : 'Atualizações prontas',
-                description: update?.message || 'Use verificar para procurar novas versões publicadas.',
+                title: update?.currentVersion ? `Versao atual v${update.currentVersion}` : 'Atualizacoes prontas',
+                description: update?.message || 'O app verifica atualizacoes automaticamente ao abrir.',
             }
     }
 }
@@ -163,4 +192,8 @@ function getReleaseNotesPreview(releaseNotes) {
     const normalized = String(releaseNotes).trim()
     if (!normalized) return ''
     return normalized.length > 180 ? `${normalized.slice(0, 177)}...` : normalized
+}
+
+function showBlockingFlag(blockingUpdateFlow) {
+    return blockingUpdateFlow
 }
